@@ -92,6 +92,10 @@ class Predicate {
   virtual EvaluationResult Evaluate(Evaluator& evaluator) const = 0;
   virtual ~Predicate() = default;
   PredicateType GetType() const { return type_; }
+  
+  // Check if this predicate tree contains any text predicates.
+  // Used to determine if we need to wait for text indexing to complete.
+  bool HasTextPredicate() const;
 
  private:
   PredicateType type_;

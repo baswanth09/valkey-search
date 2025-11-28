@@ -5,12 +5,32 @@ This implementation addresses the issue where text predicate evaluation needs to
 
 ## Changes Made
 
-### 1. Implemented Blocking Mechanism in ProcessNeighborsForReply (`src/query/response_generator.cc`)
+### 1. Added Helper Function to Detect Text Predicates (`src/query/predicate.h` & `src/query/predicate.cc`)
+
+**File: `src/query/predicate.h`**
+- Added `bool HasTextPredicate() const;` method to the `Predicate` class
+- This method recursively checks if a predicate tree contains any text predicates
+- Used to determine if we need to wait for text indexing to complete
+
+**File: `src/query/predicate.cc`**
+- Implemented `Predicate::HasTextPredicate()` which:
+  - Returns `true` for `PredicateType::kText`
+  - Recursively checks child predicates for composed predicates (AND/OR) and negated predicates
+  - Returns `false` for numeric and tag predicates
+
+**Why This is Necessary:**
+The index schema may have text fields, but the current query might only use numeric/tag filters. We need **both** conditions:
+1. Schema has text indexing capability (`GetTextIndexSchema() != nullptr`)
+2. Query actually contains text predicates (`HasTextPredicate() == true`)
+
+This avoids unnecessary blocking when queries don't use text predicates at all.
+
+### 2. Implemented Blocking Mechanism in ProcessNeighborsForReply (`src/query/response_generator.cc`)
 
 **Key Changes:**
 - Modified `ProcessNeighborsForReply` signature to return `absl::Status` instead of `void`
-- Added in-flight key detection logic when text filters are present:
-  - Uses existing `GetTextIndexSchema()` check to determine if index has text fields
+- Added in-flight key detection logic when text predicates are present:
+  - Checks BOTH `HasTextPredicate()` AND `GetTextIndexSchema()` to ensure blocking is only done when necessary
   - Checks each neighbor key using `IndexSchema::IsKeyInFlight()`
   - If keys are in-flight, enters a retry loop with the following characteristics:
     - **Max retries**: 1000 (preventing infinite loops/livelocks)
@@ -22,33 +42,33 @@ This implementation addresses the issue where text predicate evaluation needs to
 - Added `#include <unistd.h>` for `usleep()` function
 
 **Detection Logic:**
-Instead of implementing a recursive `HasTextPredicate()` helper, we use the existing pattern from `VerifyFilter()`:
 ```cpp
-const bool has_text_filter = 
+const bool needs_text_indexing = 
     parameters.filter_parse_results.root_predicate &&
+    parameters.filter_parse_results.root_predicate->HasTextPredicate() &&
     parameters.index_schema &&
     parameters.index_schema->GetTextIndexSchema() != nullptr;
 ```
 
-This is simpler and more accurate because:
-- It checks if the schema has text indexing capability (non-null `TextIndexSchema`)
-- It's the same pattern already used in `VerifyFilter()` for consistency
-- It avoids unnecessary recursive traversal of the predicate tree
-- It's more direct: if there's no `TextIndexSchema`, there can't be text predicate evaluation
+This ensures we only block when:
+- A filter/predicate exists
+- The predicate tree contains text predicates
+- The schema has text indexing capability
 
 **Rationale:**
 The blocking approach keeps the client blocked on the main thread while waiting for background ingestion to complete. This ensures:
 1. We don't create expensive temporary text indexes
 2. We evaluate against accurate, fully-indexed data
 3. The implementation is simple and doesn't require complex callback mechanisms
+4. We avoid unnecessary blocking for queries that don't use text predicates
 
-### 2. Updated Function Signature (`src/query/response_generator.h`)
+### 3. Updated Function Signature (`src/query/response_generator.h`)
 
 **Changes:**
 - Updated `ProcessNeighborsForReply` and `ProcessNonVectorNeighborsForReply` to return `absl::Status`
 - Added documentation explaining that errors are returned when processing fails
 
-### 3. Updated All Callers to Handle Status Return
+### 4. Updated All Callers to Handle Status Return
 
 **File: `src/commands/ft_search.cc`**
 - Modified `SearchCommand::SendReply()` to check status from `ProcessNeighborsForReply`
@@ -71,13 +91,13 @@ The blocking approach keeps the client blocked on the main thread while waiting 
 
 ### Normal Case (No In-Flight Keys)
 1. Search completes and returns neighbors
-2. `ProcessNeighborsForReply` checks if schema has text fields and filter exists
+2. `ProcessNeighborsForReply` checks if query has text predicates AND schema has text fields
 3. If yes, checks if any neighbor keys are in-flight
 4. If no keys are in-flight, proceeds normally with content fetching and verification
 
-### In-Flight Keys Case (Text Filters Present)
+### In-Flight Keys Case (Text Predicates Present)
 1. Search completes and returns neighbors
-2. `ProcessNeighborsForReply` detects text filter capability via `GetTextIndexSchema()`
+2. `ProcessNeighborsForReply` detects text predicates via `HasTextPredicate()` and text capability via `GetTextIndexSchema()`
 3. Finds one or more keys are in-flight
 4. Enters retry loop:
    - Yields for 1ms to allow background threads to progress
@@ -87,6 +107,13 @@ The blocking approach keeps the client blocked on the main thread while waiting 
      - Query timeout is reached → returns `absl::DeadlineExceededError`
      - Max retries reached (livelock protection)
 5. Once keys are no longer in-flight, evaluates text predicates against the per-key text indexes
+
+### Optimization: No Blocking for Non-Text Queries
+If the query only uses numeric/tag predicates (no text predicates), blocking is skipped entirely, even if:
+- The index schema has text fields
+- Some keys are being indexed in the background
+
+This is safe because numeric/tag predicate evaluation doesn't rely on the text indexes.
 
 ### Livelock Protection
 - Maximum 1000 retries (approximately 1 second of waiting)
@@ -99,44 +126,50 @@ The blocking approach keeps the client blocked on the main thread while waiting 
 - Background indexing threads progress independently
 
 ## Performance Considerations
-- **Best case**: No in-flight keys → no blocking, immediate evaluation
-- **Typical case**: Keys in-flight for short period (a few ms) → minimal blocking
+- **Best case**: No text predicates → no blocking check at all
+- **Good case**: Text predicates but no in-flight keys → single O(n) check, immediate evaluation
+- **Typical case**: Text predicates with keys in-flight for short period (a few ms) → minimal blocking
 - **Worst case**: Livelock scenario → timeout after configured query timeout or max retries
-- **No predicate case**: No overhead when filter is not present
 
-## Design Decision: Why Not `HasTextPredicate()`?
+## Example Scenarios
 
-Initially, a recursive `HasTextPredicate()` method was implemented to traverse the predicate tree. However, upon review, this was replaced with the simpler check:
-
-```cpp
-parameters.index_schema->GetTextIndexSchema() != nullptr
+### Scenario 1: Query with only numeric filter
+```
+Index: { title: TEXT, price: NUMERIC }
+Query: @price:[100 500]
+Result: No blocking (no text predicates)
 ```
 
-**Advantages of this approach:**
-1. **Consistency**: Uses the same pattern as existing `VerifyFilter()` code
-2. **Simplicity**: Single check vs recursive tree traversal
-3. **Correctness**: More accurate - checks schema capability, not just predicate presence
-4. **Performance**: O(1) check vs O(n) tree traversal
-5. **Maintainability**: No new helper function to maintain
+### Scenario 2: Query with text filter
+```
+Index: { title: TEXT, price: NUMERIC }
+Query: @title:hello @price:[100 500]
+Result: Blocking if keys are in-flight (has text predicates)
+```
 
-**Why it's correct:**
-- `VerifyFilter()` already uses this check to decide whether to evaluate using text indexes
-- If `GetTextIndexSchema()` returns null, text predicates cannot be evaluated anyway
-- If it's non-null and there's a filter, we need to wait for in-flight keys regardless of whether the current query actually uses text predicates (defensive approach)
+### Scenario 3: Index with no text fields
+```
+Index: { price: NUMERIC, rating: NUMERIC }
+Query: @price:[100 500]
+Result: No blocking (GetTextIndexSchema() returns null)
+```
 
 ## Testing
 - Existing tests updated to handle new status return
 - Livelock scenario is expected to be rare (as mentioned in task description)
 - Integration tests should verify behavior with concurrent mutations
+- Should test that queries without text predicates don't block unnecessarily
 
 ## Compatibility
 - This is a prerequisite-aware implementation that builds on commit 8723c7b52f2af3aac9f2c5f1ffecbe0268b4d649
 - Leverages the existing `IsKeyInFlight()` utility added in that commit
 - No breaking changes to external API
-- Follows existing code patterns for text predicate detection
+- Optimizes for the common case where queries don't use text predicates
 
 ## Files Modified
-- `src/query/response_generator.cc` - Core implementation
+- `src/query/predicate.h` - Added HasTextPredicate() method
+- `src/query/predicate.cc` - Implemented HasTextPredicate() method
+- `src/query/response_generator.cc` - Core blocking implementation
 - `src/query/response_generator.h` - Function signature update
 - `src/commands/ft_search.cc` - Status handling
 - `src/commands/ft_aggregate.cc` - Status handling
