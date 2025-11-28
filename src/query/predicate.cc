@@ -25,28 +25,6 @@
 
 namespace valkey_search::query {
 
-bool Predicate::HasTextPredicate() const {
-  switch (type_) {
-    case PredicateType::kText:
-      return true;
-    case PredicateType::kNegate: {
-      const auto* negate = static_cast<const NegatePredicate*>(this);
-      return negate->GetPredicate()->HasTextPredicate();
-    }
-    case PredicateType::kComposedAnd:
-    case PredicateType::kComposedOr: {
-      const auto* composed = static_cast<const ComposedPredicate*>(this);
-      return composed->GetLhsPredicate()->HasTextPredicate() ||
-             composed->GetRhsPredicate()->HasTextPredicate();
-    }
-    case PredicateType::kTag:
-    case PredicateType::kNumeric:
-    case PredicateType::kNone:
-      return false;
-  }
-  return false;
-}
-
 EvaluationResult NegatePredicate::Evaluate(Evaluator& evaluator) const {
   EvaluationResult result = predicate_->Evaluate(evaluator);
   return EvaluationResult(!result.matches);

@@ -279,15 +279,16 @@ absl::Status ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
                               std::deque<indexes::Neighbor> &neighbors,
                               const query::SearchParameters &parameters,
                               const std::string &identifier) {
-  // Check if we have text predicates in the filter
-  const bool has_text_predicate = 
+  // Check if we need to evaluate text predicates (schema has text fields and filter exists)
+  const bool has_text_filter = 
       parameters.filter_parse_results.root_predicate &&
-      parameters.filter_parse_results.root_predicate->HasTextPredicate();
+      parameters.index_schema &&
+      parameters.index_schema->GetTextIndexSchema() != nullptr;
   
-  // If we have text predicates, wait for any in-flight keys to finish indexing
+  // If we have text filters, wait for any in-flight keys to finish indexing
   // This ensures we can safely evaluate text predicates against the per-key
   // text indexes created by background ingestion.
-  if (has_text_predicate && parameters.index_schema) {
+  if (has_text_filter) {
     constexpr int kMaxRetries = 1000;  // Prevent infinite loops (livelock protection)
     constexpr int kRetryDelayUs = 1000;  // 1ms between retries
     
@@ -311,7 +312,7 @@ absl::Status ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
       // Keys are still in-flight, yield and retry
       if (retry == 0) {
         VMSDK_LOG(DEBUG, ctx) << "Found " << in_flight_keys.size() 
-                              << " in-flight keys with text predicates. "
+                              << " in-flight keys with text filter. "
                               << "Waiting for background ingestion to complete.";
       }
       
