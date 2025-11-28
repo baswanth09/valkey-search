@@ -7,6 +7,8 @@
 
 #include "src/query/response_generator.h"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <deque>
 #include <optional>
@@ -152,8 +154,8 @@ bool VerifyFilter(const query::Predicate *predicate, const RecordsMap &records,
   // For text predicates, evaluate using the text index instead of raw data.
   if (parameters.index_schema &&
       parameters.index_schema->GetTextIndexSchema()) {
-    // TODO: Wait for any in-flight indexing operations to complete before
-    // acquiring the lock, ensuring we evaluate against the latest index state.
+    // Evaluate against the per-key text indexes created by background ingestion.
+    // This assumes the key is no longer in-flight and has been fully indexed.
     return parameters.index_schema->GetTextIndexSchema()->WithPerKeyTextIndexes(
         [&](auto &per_key_indexes) {
           PredicateEvaluator evaluator(records, &per_key_indexes, target_key);
@@ -256,22 +258,80 @@ absl::StatusOr<RecordsMap> GetContent(
 
 // Adds all local content for neighbors to the list of neighbors.
 // This function is meant to be used for non-vector queries.
-void ProcessNonVectorNeighborsForReply(
+absl::Status ProcessNonVectorNeighborsForReply(
     ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
     std::deque<indexes::Neighbor> &neighbors,
     const query::SearchParameters &parameters) {
-  ProcessNeighborsForReply(ctx, attribute_data_type, neighbors, parameters, "");
+  return ProcessNeighborsForReply(ctx, attribute_data_type, neighbors, parameters, "");
 }
 
 // Adds all local content for neighbors to the list of neighbors.
 //
 // Any neighbors already contained in the attribute content map will be skipped.
 // Any data not found locally will be skipped.
-void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
+//
+// For queries with text predicates, this function checks if any neighbor keys
+// are in-flight (being mutated/indexed). If so, it keeps the client blocked
+// by yielding and retrying periodically until the background ingestion completes,
+// ensuring we can safely evaluate text predicates against the per-key text indexes.
+absl::Status ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
                               const AttributeDataType &attribute_data_type,
                               std::deque<indexes::Neighbor> &neighbors,
                               const query::SearchParameters &parameters,
                               const std::string &identifier) {
+  // Check if we have text predicates in the filter
+  const bool has_text_predicate = 
+      parameters.filter_parse_results.root_predicate &&
+      parameters.filter_parse_results.root_predicate->HasTextPredicate();
+  
+  // If we have text predicates, wait for any in-flight keys to finish indexing
+  // This ensures we can safely evaluate text predicates against the per-key
+  // text indexes created by background ingestion.
+  if (has_text_predicate && parameters.index_schema) {
+    constexpr int kMaxRetries = 1000;  // Prevent infinite loops (livelock protection)
+    constexpr int kRetryDelayUs = 1000;  // 1ms between retries
+    
+    for (int retry = 0; retry < kMaxRetries; ++retry) {
+      absl::flat_hash_set<InternedStringPtr> in_flight_keys;
+      for (const auto &neighbor : neighbors) {
+        if (neighbor.attribute_contents.has_value()) {
+          // Already has content, skip
+          continue;
+        }
+        if (parameters.index_schema->IsKeyInFlight(neighbor.external_id)) {
+          in_flight_keys.insert(neighbor.external_id);
+        }
+      }
+      
+      // If no keys are in-flight, proceed with processing
+      if (in_flight_keys.empty()) {
+        break;
+      }
+      
+      // Keys are still in-flight, yield and retry
+      if (retry == 0) {
+        VMSDK_LOG(DEBUG, ctx) << "Found " << in_flight_keys.size() 
+                              << " in-flight keys with text predicates. "
+                              << "Waiting for background ingestion to complete.";
+      }
+      
+      // Check for cancellation/timeout
+      if (parameters.cancellation_token->IsCancelled()) {
+        return absl::DeadlineExceededError(
+            "Timed out waiting for in-flight keys to complete indexing");
+      }
+      
+      // Yield briefly to allow background indexing to progress
+      usleep(kRetryDelayUs);
+      
+      // Log if we're retrying for too long (potential livelock)
+      if (retry > 0 && retry % 100 == 0) {
+        VMSDK_LOG(WARNING, ctx) << "Still waiting for " << in_flight_keys.size()
+                                << " in-flight keys after " << retry << " retries";
+      }
+    }
+  }
+  
   const auto max_content_size =
       options::GetMaxSearchResultRecordSize().GetValue();
   const auto max_content_fields =
@@ -327,6 +387,8 @@ void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
                        return !neighbor.attribute_contents.has_value();
                      }),
       neighbors.end());
+  
+  return absl::OkStatus();
 }
 
 }  // namespace valkey_search::query

@@ -157,17 +157,25 @@ grpc::ServerUnaryReactor* Service::SearchIndexPartition(
             const auto& attribute_data_type =
                 parameters->index_schema->GetAttributeDataType();
             auto ctx = vmsdk::MakeUniqueValkeyThreadSafeContext(nullptr);
+            absl::Status status;
             if (parameters->attribute_alias.empty()) {
-              query::ProcessNonVectorNeighborsForReply(
+              status = query::ProcessNonVectorNeighborsForReply(
                   ctx.get(), attribute_data_type, neighbors, *parameters);
             } else {
               auto vector_identifier =
                   parameters->index_schema
                       ->GetIdentifier(parameters->attribute_alias)
                       .value();
-              query::ProcessNeighborsForReply(ctx.get(), attribute_data_type,
+              status = query::ProcessNeighborsForReply(ctx.get(), attribute_data_type,
                                               neighbors, *parameters,
                                               vector_identifier);
+            }
+            if (!status.ok()) {
+              VMSDK_LOG(WARNING, ctx.get())
+                  << "Failed to process neighbors for reply: " << status.message();
+              reactor->Finish(ToGrpcStatus(status));
+              RecordSearchMetrics(true, std::move(latency_sample));
+              return;
             }
             SerializeNeighbors(response, neighbors);
             reactor->Finish(grpc::Status::OK);

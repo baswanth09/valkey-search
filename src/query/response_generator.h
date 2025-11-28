@@ -36,13 +36,16 @@ namespace valkey_search::query {
 // Neighbor already contained in the attribute content map.
 // Neighbor without any attribute content.
 // Neighbor not comply to the pre-filter expression.
-void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
+// 
+// Returns absl::UnavailableError if the processing needs to be retried
+// due to in-flight keys conflicting with text predicate evaluation.
+absl::Status ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
                               const AttributeDataType &attribute_data_type,
                               std::deque<indexes::Neighbor> &neighbors,
                               const query::SearchParameters &parameters,
                               const std::string &identifier);
 
-void ProcessNonVectorNeighborsForReply(
+absl::Status ProcessNonVectorNeighborsForReply(
     ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
     std::deque<indexes::Neighbor> &neighbors,
     const query::SearchParameters &parameters);

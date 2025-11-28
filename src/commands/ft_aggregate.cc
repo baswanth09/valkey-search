@@ -172,9 +172,12 @@ absl::Status SendReplyInner(ValkeyModuleCtx *ctx,
     return identifier.status();
   }
 
-  query::ProcessNeighborsForReply(
+  auto status = query::ProcessNeighborsForReply(
       ctx, parameters.index_schema->GetAttributeDataType(), neighbors,
       parameters, identifier.value());
+  if (!status.ok()) {
+    return status;
+  }
 
   size_t key_index = 0, scores_index = 0;
   if (parameters.load_key) {

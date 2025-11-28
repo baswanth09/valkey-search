@@ -165,8 +165,13 @@ void SearchCommand::SendReply(ValkeyModuleCtx *ctx,
 
   // Support non-vector queries: no attribute_alias and k == 0
   if (IsNonVectorQuery()) {
-    query::ProcessNonVectorNeighborsForReply(
+    auto status = query::ProcessNonVectorNeighborsForReply(
         ctx, index_schema->GetAttributeDataType(), neighbors, *this);
+    if (!status.ok()) {
+      ++Metrics::GetStats().query_failed_requests_cnt;
+      ValkeyModule_ReplyWithError(ctx, status.message().data());
+      return;
+    }
     SerializeNonVectorNeighbors(ctx, neighbors, *this);
     return;
   }
@@ -186,8 +191,14 @@ void SearchCommand::SendReply(ValkeyModuleCtx *ctx,
     ValkeyModule_ReplyWithError(ctx, identifier.status().message().data());
     return;
   }
-  query::ProcessNeighborsForReply(ctx, index_schema->GetAttributeDataType(),
-                                  neighbors, *this, identifier.value());
+  auto status = query::ProcessNeighborsForReply(
+      ctx, index_schema->GetAttributeDataType(), neighbors, *this,
+      identifier.value());
+  if (!status.ok()) {
+    ++Metrics::GetStats().query_failed_requests_cnt;
+    ValkeyModule_ReplyWithError(ctx, status.message().data());
+    return;
+  }
 
   SerializeNeighbors(ctx, neighbors, *this);
 }

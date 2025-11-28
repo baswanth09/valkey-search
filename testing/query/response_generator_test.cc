@@ -142,7 +142,7 @@ TEST_P(ResponseGeneratorTest, ProcessNeighborsForReply) {
         });
   }
   ProcessNeighborsForReply(&fake_ctx, data_type, expected_neighbors, parameters,
-                           parameters.attribute_alias);
+                           parameters.attribute_alias).IgnoreError();
   EXPECT_EQ(expected_neighbors.size(), params.expected_neighbors.size());
   for (size_t i = 0; i < params.expected_neighbors.size(); ++i) {
     EXPECT_EQ(std::string(*expected_neighbors[i].external_id),
@@ -257,7 +257,7 @@ TEST_F(ResponseGeneratorTest, ProcessNeighborsForReplyContentLimits) {
       });
 
   ProcessNeighborsForReply(&fake_ctx, data_type, neighbors, parameters,
-                           parameters.attribute_alias);
+                           parameters.attribute_alias).IgnoreError();
 
   // Verify that only the neighbor with small content remains
   // (both large content and many fields neighbors should be filtered out)
