@@ -26,6 +26,7 @@
 #include "src/metrics.h"
 #include "src/query/response_generator.h"
 #include "src/query/search.h"
+#include "vmsdk/src/log.h"
 #include "vmsdk/src/managed_pointers.h"
 #include "vmsdk/src/type_conversions.h"
 #include "vmsdk/src/valkey_module_api/valkey_module.h"
@@ -165,8 +166,21 @@ void SearchCommand::SendReply(ValkeyModuleCtx *ctx,
 
   // Support non-vector queries: no attribute_alias and k == 0
   if (IsNonVectorQuery()) {
-    query::ProcessNonVectorNeighborsForReply(
+    // Note: For pure full-text queries (queries with text predicates),
+    // the in-flight key check is performed in the callback before unblocking
+    // the client. By the time we reach here, all keys should be properly
+    // indexed. The kKeysInFlight result is only returned in the rare case
+    // where this function is called directly (e.g., synchronous path with
+    // parallel queries disabled).
+    auto result = query::ProcessNonVectorNeighborsForReply(
         ctx, index_schema->GetAttributeDataType(), neighbors, *this);
+    if (result == query::ProcessNeighborsResult::kKeysInFlight) {
+      // This should not happen in the normal async path, but handle it
+      // gracefully. The client will receive results that may not have
+      // text predicates evaluated against the latest indexed data.
+      VMSDK_LOG(WARNING, ctx)
+          << "Processing non-vector query with in-flight keys in sync path";
+    }
     SerializeNonVectorNeighbors(ctx, neighbors, *this);
     return;
   }

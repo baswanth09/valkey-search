@@ -25,6 +25,7 @@
 #include "src/metrics.h"
 #include "src/query/predicate.h"
 #include "src/query/search.h"
+#include "vmsdk/src/log.h"
 #include "vmsdk/src/managed_pointers.h"
 #include "vmsdk/src/module_config.h"
 #include "vmsdk/src/status/status_macros.h"
@@ -150,10 +151,11 @@ bool VerifyFilter(const query::Predicate *predicate, const RecordsMap &records,
     return true;
   }
   // For text predicates, evaluate using the text index instead of raw data.
+  // Note: For pure full-text queries (non-vector), in-flight key checking and
+  // waiting is handled in the callback before this function is called.
+  // See async::TryUnblockNonVectorQuery in commands.cc.
   if (parameters.index_schema &&
       parameters.index_schema->GetTextIndexSchema()) {
-    // TODO: Wait for any in-flight indexing operations to complete before
-    // acquiring the lock, ensuring we evaluate against the latest index state.
     return parameters.index_schema->GetTextIndexSchema()->WithPerKeyTextIndexes(
         [&](auto &per_key_indexes) {
           PredicateEvaluator evaluator(records, &per_key_indexes, target_key);
@@ -256,11 +258,32 @@ absl::StatusOr<RecordsMap> GetContent(
 
 // Adds all local content for neighbors to the list of neighbors.
 // This function is meant to be used for non-vector queries.
-void ProcessNonVectorNeighborsForReply(
+// For pure full-text queries (queries with text predicates), checks if any
+// neighbor keys are in-flight (being indexed by background threads).
+// Returns kKeysInFlight if any keys conflict with in-flight mutations,
+// indicating the client should wait and retry later.
+ProcessNeighborsResult ProcessNonVectorNeighborsForReply(
     ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
     std::deque<indexes::Neighbor> &neighbors,
     const query::SearchParameters &parameters) {
+  // For pure full-text queries with text predicates, check if any response keys
+  // are in-flight (in the mutation queue). If so, we need to wait for the
+  // background ingestion to complete before evaluating text predicates.
+  if (parameters.index_schema &&
+      parameters.index_schema->GetTextIndexSchema() &&
+      ContainsTextPredicate(
+          parameters.filter_parse_results.root_predicate.get())) {
+    for (const auto &neighbor : neighbors) {
+      if (parameters.index_schema->IsKeyInFlight(neighbor.external_id)) {
+        VMSDK_LOG(DEBUG, ctx)
+            << "Key " << neighbor.external_id->Str()
+            << " is in-flight, waiting for background indexing to complete";
+        return ProcessNeighborsResult::kKeysInFlight;
+      }
+    }
+  }
   ProcessNeighborsForReply(ctx, attribute_data_type, neighbors, parameters, "");
+  return ProcessNeighborsResult::kSuccess;
 }
 
 // Adds all local content for neighbors to the list of neighbors.

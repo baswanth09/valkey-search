@@ -31,6 +31,15 @@ vmsdk::config::Number &GetMaxSearchResultFieldsCount();
 }  // namespace valkey_search::options
 namespace valkey_search::query {
 
+// Enum indicating the result of processing neighbors for reply.
+// kSuccess: Processing completed successfully, results are ready.
+// kKeysInFlight: Some keys are in-flight (being indexed by background threads),
+//                client should wait and retry later.
+enum class ProcessNeighborsResult {
+  kSuccess,
+  kKeysInFlight,
+};
+
 // Adds all local content for neighbors to the list of neighbors.
 // Skipping neighbors if one of the following:
 // Neighbor already contained in the attribute content map.
@@ -42,7 +51,12 @@ void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
                               const query::SearchParameters &parameters,
                               const std::string &identifier);
 
-void ProcessNonVectorNeighborsForReply(
+// Processes neighbors for non-vector queries.
+// For pure full-text queries, checks if any neighbor keys are in-flight
+// (being indexed by background threads). If so, returns kKeysInFlight
+// to indicate the client should wait and retry.
+// This ensures text predicate evaluation uses the correctly indexed data.
+ProcessNeighborsResult ProcessNonVectorNeighborsForReply(
     ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
     std::deque<indexes::Neighbor> &neighbors,
     const query::SearchParameters &parameters);

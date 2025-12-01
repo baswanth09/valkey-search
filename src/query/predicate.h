@@ -86,6 +86,9 @@ struct EstimatedQualifiedEntries {
   std::vector<Predicate*> predicates;
 };
 
+// Returns true if the predicate tree contains any text predicates
+bool ContainsTextPredicate(const Predicate* predicate);
+
 class Predicate {
  public:
   explicit Predicate(PredicateType type) : type_(type) {}
