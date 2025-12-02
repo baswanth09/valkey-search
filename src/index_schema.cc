@@ -1225,6 +1225,42 @@ bool IndexSchema::IsKeyInFlight(const InternedStringPtr &key) const {
   return tracked_mutated_records_.contains(key);
 }
 
+bool IndexSchema::HasInFlightKeys(
+    const std::vector<InternedStringPtr> &keys) const {
+  absl::MutexLock lock(&mutated_records_mutex_);
+  for (const auto &key : keys) {
+    if (tracked_mutated_records_.contains(key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IndexSchema::WaitForInFlightKeys(
+    const std::vector<InternedStringPtr> &keys, absl::Time deadline) const {
+  // Polling interval for checking in-flight keys
+  constexpr absl::Duration kPollInterval = absl::Milliseconds(1);
+
+  while (absl::Now() < deadline) {
+    {
+      absl::MutexLock lock(&mutated_records_mutex_);
+      bool all_ready = true;
+      for (const auto &key : keys) {
+        if (tracked_mutated_records_.contains(key)) {
+          all_ready = false;
+          break;
+        }
+      }
+      if (all_ready) {
+        return true;  // All keys are ready
+      }
+    }
+    // Sleep briefly before retrying
+    absl::SleepFor(kPollInterval);
+  }
+  return false;  // Timeout reached
+}
+
 bool IndexSchema::InTrackedMutationRecords(
     const InternedStringPtr &key, const std::string &identifier) const {
   absl::MutexLock lock(&mutated_records_mutex_);

@@ -12,19 +12,24 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "src/attribute_data_type.h"
+#include "src/index_schema.h"
 #include "src/indexes/tag.h"
 #include "src/indexes/text.h"
 #include "src/indexes/vector_base.h"
 #include "src/metrics.h"
 #include "src/query/predicate.h"
 #include "src/query/search.h"
+#include "vmsdk/src/log.h"
 #include "vmsdk/src/managed_pointers.h"
 #include "vmsdk/src/module_config.h"
 #include "vmsdk/src/status/status_macros.h"
@@ -152,8 +157,6 @@ bool VerifyFilter(const query::Predicate *predicate, const RecordsMap &records,
   // For text predicates, evaluate using the text index instead of raw data.
   if (parameters.index_schema &&
       parameters.index_schema->GetTextIndexSchema()) {
-    // TODO: Wait for any in-flight indexing operations to complete before
-    // acquiring the lock, ensuring we evaluate against the latest index state.
     return parameters.index_schema->GetTextIndexSchema()->WithPerKeyTextIndexes(
         [&](auto &per_key_indexes) {
           PredicateEvaluator evaluator(records, &per_key_indexes, target_key);
@@ -164,6 +167,58 @@ bool VerifyFilter(const query::Predicate *predicate, const RecordsMap &records,
   PredicateEvaluator evaluator(records);
   EvaluationResult result = predicate->Evaluate(evaluator);
   return result.matches;
+}
+
+// Maximum time to wait for in-flight mutations before proceeding.
+// This prevents indefinite blocking while allowing time for mutations to
+// complete.
+constexpr absl::Duration kMaxInFlightWaitTime = absl::Milliseconds(100);
+
+// Waits for in-flight mutations to complete for the given keys.
+// Returns true if all keys are ready, false if timeout was reached.
+// This is only called for pure full-text queries to ensure text indexes
+// are up-to-date before verification.
+bool WaitForInFlightMutations(
+    const std::deque<indexes::Neighbor> &neighbors,
+    const query::SearchParameters &parameters) {
+  if (!parameters.index_schema) {
+    return true;
+  }
+
+  // Collect keys that need to be checked
+  std::vector<InternedStringPtr> keys_to_check;
+  keys_to_check.reserve(neighbors.size());
+  for (const auto &neighbor : neighbors) {
+    // Skip neighbors that already have content (from remote nodes)
+    if (!neighbor.attribute_contents.has_value()) {
+      keys_to_check.push_back(neighbor.external_id);
+    }
+  }
+
+  if (keys_to_check.empty()) {
+    return true;
+  }
+
+  // Check if any keys have in-flight mutations
+  if (!parameters.index_schema->HasInFlightKeys(keys_to_check)) {
+    return true;  // No conflicts, proceed immediately
+  }
+
+  // Wait for in-flight mutations to complete
+  absl::Time deadline = absl::Now() + kMaxInFlightWaitTime;
+  bool all_ready =
+      parameters.index_schema->WaitForInFlightKeys(keys_to_check, deadline);
+
+  if (!all_ready) {
+    VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 1)
+        << "Timeout waiting for in-flight mutations during full-text query "
+           "verification. Some results may be inconsistent.";
+    ++Metrics::GetStats().fulltext_inflight_wait_timeouts;
+  } else {
+    ++Metrics::GetStats().fulltext_inflight_wait_success;
+  }
+
+  return all_ready;
 }
 
 absl::StatusOr<RecordsMap> GetContentNoReturnJson(
@@ -267,11 +322,24 @@ void ProcessNonVectorNeighborsForReply(
 //
 // Any neighbors already contained in the attribute content map will be skipped.
 // Any data not found locally will be skipped.
+//
+// For pure full-text queries (text predicates without vector field), this
+// function will wait for any in-flight mutations to complete before
+// proceeding with verification. This ensures that text indexes are up-to-date
+// and we can use them for verification instead of creating temporary indexes.
 void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
                               const AttributeDataType &attribute_data_type,
                               std::deque<indexes::Neighbor> &neighbors,
                               const query::SearchParameters &parameters,
                               const std::string &identifier) {
+  // For pure full-text queries, wait for in-flight mutations to complete.
+  // This allows us to use the background-populated text indexes for
+  // verification instead of creating expensive temporary indexes.
+  // Vector and hybrid queries bypass this blocking mechanism.
+  if (parameters.IsPureFullTextQuery()) {
+    WaitForInFlightMutations(neighbors, parameters);
+  }
+
   const auto max_content_size =
       options::GetMaxSearchResultRecordSize().GetValue();
   const auto max_content_fields =

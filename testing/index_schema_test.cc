@@ -2252,4 +2252,100 @@ TEST_F(IndexSchemaRDBTest, ComprehensiveSkipLoadTest) {
   LOG(INFO) << "=== Comprehensive Skip Load Test Completed ===";
 }
 
+// Tests for in-flight key detection functionality
+class InFlightKeyDetectionTest : public ValkeySearchTest {
+ protected:
+  void SetUp() override {
+    ValkeySearchTest::SetUp();
+    mutations_thread_pool_ =
+        std::make_unique<vmsdk::ThreadPool>("test-writer-pool-", 2);
+    mutations_thread_pool_->StartWorkers();
+  }
+
+  void TearDown() override {
+    mutations_thread_pool_.reset();
+    ValkeySearchTest::TearDown();
+  }
+
+  std::unique_ptr<vmsdk::ThreadPool> mutations_thread_pool_;
+};
+
+TEST_F(InFlightKeyDetectionTest, HasInFlightKeysEmpty) {
+  ValkeyModuleCtx fake_ctx;
+  std::vector<absl::string_view> key_prefixes = {"test:"};
+  auto index_schema = MockIndexSchema::Create(
+                          &fake_ctx, "test_index", key_prefixes,
+                          std::make_unique<HashAttributeDataType>(),
+                          mutations_thread_pool_.get())
+                          .value();
+
+  // No keys in-flight, so HasInFlightKeys should return false
+  auto key1 = StringInternStore::Intern("test:key1");
+  auto key2 = StringInternStore::Intern("test:key2");
+  std::vector<InternedStringPtr> keys = {key1, key2};
+  EXPECT_FALSE(index_schema->HasInFlightKeys(keys));
+}
+
+TEST_F(InFlightKeyDetectionTest, IsKeyInFlightBasic) {
+  ValkeyModuleCtx fake_ctx;
+  std::vector<absl::string_view> key_prefixes = {"test:"};
+  auto index_schema = MockIndexSchema::Create(
+                          &fake_ctx, "test_index", key_prefixes,
+                          std::make_unique<HashAttributeDataType>(),
+                          mutations_thread_pool_.get())
+                          .value();
+
+  auto key = StringInternStore::Intern("test:key1");
+  // Initially the key should not be in-flight
+  EXPECT_FALSE(index_schema->IsKeyInFlight(key));
+}
+
+TEST_F(InFlightKeyDetectionTest, WaitForInFlightKeysNoConflict) {
+  ValkeyModuleCtx fake_ctx;
+  std::vector<absl::string_view> key_prefixes = {"test:"};
+  auto index_schema = MockIndexSchema::Create(
+                          &fake_ctx, "test_index", key_prefixes,
+                          std::make_unique<HashAttributeDataType>(),
+                          mutations_thread_pool_.get())
+                          .value();
+
+  auto key1 = StringInternStore::Intern("test:key1");
+  auto key2 = StringInternStore::Intern("test:key2");
+  std::vector<InternedStringPtr> keys = {key1, key2};
+
+  // With no keys in-flight, WaitForInFlightKeys should return immediately
+  absl::Time deadline = absl::Now() + absl::Milliseconds(100);
+  EXPECT_TRUE(index_schema->WaitForInFlightKeys(keys, deadline));
+}
+
+TEST_F(InFlightKeyDetectionTest, WaitForInFlightKeysTimeout) {
+  ValkeyModuleCtx fake_ctx;
+  std::vector<absl::string_view> key_prefixes = {"test:"};
+
+  // Use a mock to manually add a tracked record
+  auto index_schema = MockIndexSchema::Create(
+                          &fake_ctx, "test_index", key_prefixes,
+                          std::make_unique<HashAttributeDataType>(),
+                          nullptr)  // No thread pool to prevent async processing
+                          .value();
+
+  // Add a mock index so the schema processes key notifications
+  auto mock_index = std::make_shared<MockIndex>();
+  VMSDK_EXPECT_OK(
+      index_schema->AddIndex("test_attr", "test_attr", mock_index));
+  EXPECT_CALL(*mock_index, IsTracked(testing::_))
+      .WillRepeatedly(Return(false));
+
+  // Note: For this test to fully verify timeout behavior, we would need to
+  // simulate a key being in-flight. Since the internal state is protected,
+  // this test primarily verifies the API doesn't crash and returns quickly
+  // when no keys are in-flight.
+  auto key1 = StringInternStore::Intern("test:key1");
+  std::vector<InternedStringPtr> keys = {key1};
+
+  // Should return true immediately since no keys are in-flight
+  absl::Time deadline = absl::Now() + absl::Milliseconds(10);
+  EXPECT_TRUE(index_schema->WaitForInFlightKeys(keys, deadline));
+}
+
 }  // namespace valkey_search

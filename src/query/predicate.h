@@ -93,6 +93,10 @@ class Predicate {
   virtual ~Predicate() = default;
   PredicateType GetType() const { return type_; }
 
+  // Returns true if this predicate or any of its children contain text
+  // predicates. Used to determine if a query requires text index verification.
+  virtual bool HasTextPredicates() const = 0;
+
  private:
   PredicateType type_;
 };
@@ -103,6 +107,9 @@ class NegatePredicate : public Predicate {
       : Predicate(PredicateType::kNegate), predicate_(std::move(predicate)) {}
   EvaluationResult Evaluate(Evaluator& evaluator) const override;
   const Predicate* GetPredicate() const { return predicate_.get(); }
+  bool HasTextPredicates() const override {
+    return predicate_ && predicate_->HasTextPredicates();
+  }
 
  private:
   std::unique_ptr<Predicate> predicate_;
@@ -127,6 +134,7 @@ class NumericPredicate : public Predicate {
   bool IsEndInclusive() const { return is_inclusive_end_; }
   EvaluationResult Evaluate(Evaluator& evaluator) const override;
   EvaluationResult Evaluate(const double* value) const;
+  bool HasTextPredicates() const override { return false; }
 
  private:
   const indexes::Numeric* index_;
@@ -156,6 +164,7 @@ class TagPredicate : public Predicate {
   }
   const std::string& GetTagString() const { return raw_tag_string_; }
   const absl::flat_hash_set<std::string>& GetTags() const { return tags_; }
+  bool HasTextPredicates() const override { return false; }
 
  private:
   const indexes::Tag* index_;
@@ -182,6 +191,7 @@ class TextPredicate : public Predicate {
   virtual void* Search(bool negate) const;
   virtual std::unique_ptr<indexes::text::TextIterator> BuildTextIterator(
       const void* fetcher) const = 0;
+  bool HasTextPredicates() const override { return true; }
 };
 
 class TermPredicate : public TextPredicate {
@@ -358,6 +368,10 @@ class ComposedPredicate : public Predicate {
   const Predicate* GetRhsPredicate() const { return rhs_predicate_.get(); }
   std::optional<uint32_t> GetSlop() const { return slop_; }
   bool GetInorder() const { return inorder_; }
+  bool HasTextPredicates() const override {
+    return (lhs_predicate_ && lhs_predicate_->HasTextPredicates()) ||
+           (rhs_predicate_ && rhs_predicate_->HasTextPredicates());
+  }
 
  private:
   std::unique_ptr<Predicate> lhs_predicate_;

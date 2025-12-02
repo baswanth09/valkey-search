@@ -36,6 +36,12 @@ namespace valkey_search::query {
 // Neighbor already contained in the attribute content map.
 // Neighbor without any attribute content.
 // Neighbor not comply to the pre-filter expression.
+//
+// For pure full-text queries (containing text predicates but no vector field),
+// this function will block and wait for any in-flight mutations to complete
+// before proceeding with filter verification. This ensures that text indexes
+// are up-to-date and can be used for verification instead of creating
+// expensive temporary indexes. Vector and hybrid queries bypass this blocking.
 void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
                               const AttributeDataType &attribute_data_type,
                               std::deque<indexes::Neighbor> &neighbors,

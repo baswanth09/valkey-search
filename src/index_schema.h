@@ -294,6 +294,19 @@ class IndexSchema : public KeyspaceEventSubscription,
       ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
   bool IsKeyInFlight(const InternedStringPtr &key) const
       ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
+
+  // Checks if any of the provided keys are in-flight (pending mutations).
+  // Returns true if at least one key has pending mutations.
+  bool HasInFlightKeys(
+      const std::vector<InternedStringPtr> &keys) const
+      ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
+
+  // Waits for in-flight mutations to complete for the given keys.
+  // Returns true if all keys are now ready (no longer in-flight), false if
+  // timeout was reached. The deadline is an absolute time point.
+  bool WaitForInFlightKeys(
+      const std::vector<InternedStringPtr> &keys,
+      absl::Time deadline) const ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
   std::optional<MutatedAttributes> ConsumeTrackedMutatedAttribute(
       const InternedStringPtr &key, bool first_time)
       ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);

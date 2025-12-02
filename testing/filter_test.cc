@@ -803,5 +803,111 @@ INSTANTIATE_TEST_SUITE_P(
       return info.param.test_name;
     });
 
+// Tests for HasTextPredicates method on predicates
+struct HasTextPredicatesTestCase {
+  std::string test_name;
+  std::string filter;
+  bool expected_has_text_predicates;
+};
+
+class HasTextPredicatesTest
+    : public ValkeySearchTestWithParam<HasTextPredicatesTestCase> {};
+
+TEST_P(HasTextPredicatesTest, HasTextPredicates) {
+  const HasTextPredicatesTestCase &test_case = GetParam();
+  auto index_schema = CreateIndexSchema("index_schema_name").value();
+  InitIndexSchema(index_schema.get());
+  EXPECT_CALL(*index_schema, GetIdentifier(::testing::_))
+      .Times(::testing::AnyNumber());
+  FilterParser parser(*index_schema, test_case.filter, {});
+  auto parse_results = parser.Parse();
+  ASSERT_TRUE(parse_results.ok()) << parse_results.status().message();
+  if (parse_results->root_predicate) {
+    EXPECT_EQ(test_case.expected_has_text_predicates,
+              parse_results->root_predicate->HasTextPredicates());
+  } else {
+    // Match-all expressions don't have a predicate
+    EXPECT_FALSE(test_case.expected_has_text_predicates);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    HasTextPredicatesTests, HasTextPredicatesTest,
+    ValuesIn<HasTextPredicatesTestCase>({
+        {
+            .test_name = "text_only_term",
+            .filter = "hello",
+            .expected_has_text_predicates = true,
+        },
+        {
+            .test_name = "text_only_phrase",
+            .filter = "\"hello world\"",
+            .expected_has_text_predicates = true,
+        },
+        {
+            .test_name = "text_with_field",
+            .filter = "@text_field1:hello",
+            .expected_has_text_predicates = true,
+        },
+        {
+            .test_name = "numeric_only",
+            .filter = "@num_field_1.5:[1.0 2.0]",
+            .expected_has_text_predicates = false,
+        },
+        {
+            .test_name = "tag_only",
+            .filter = "@tag_field_1:{tag1}",
+            .expected_has_text_predicates = false,
+        },
+        {
+            .test_name = "text_and_numeric",
+            .filter = "hello @num_field_1.5:[1.0 2.0]",
+            .expected_has_text_predicates = true,
+        },
+        {
+            .test_name = "text_and_tag",
+            .filter = "hello @tag_field_1:{tag1}",
+            .expected_has_text_predicates = true,
+        },
+        {
+            .test_name = "numeric_and_tag",
+            .filter = "@num_field_1.5:[1.0 2.0] @tag_field_1:{tag1}",
+            .expected_has_text_predicates = false,
+        },
+        {
+            .test_name = "text_or_numeric",
+            .filter = "hello | @num_field_1.5:[1.0 2.0]",
+            .expected_has_text_predicates = true,
+        },
+        {
+            .test_name = "negated_text",
+            .filter = "-hello @num_field_1.5:[1.0 2.0]",
+            .expected_has_text_predicates = true,
+        },
+        {
+            .test_name = "negated_numeric_only",
+            .filter = "-@num_field_1.5:[1.0 2.0]",
+            .expected_has_text_predicates = false,
+        },
+        {
+            .test_name = "prefix_search",
+            .filter = "hel*",
+            .expected_has_text_predicates = true,
+        },
+        {
+            .test_name = "suffix_search",
+            .filter = "@text_field2:*llo",
+            .expected_has_text_predicates = true,
+        },
+        {
+            .test_name = "match_all",
+            .filter = "*",
+            .expected_has_text_predicates = false,
+        },
+    }),
+    [](const TestParamInfo<HasTextPredicatesTestCase> &info) {
+      return info.param.test_name;
+    });
+
 }  // namespace
 }  // namespace valkey_search

@@ -114,6 +114,22 @@ struct SearchParameters {
   } parse_vars;
   bool IsNonVectorQuery() const { return attribute_alias.empty(); }
   bool IsVectorQuery() const { return !IsNonVectorQuery(); }
+
+  // Returns true if this is a pure full-text query (contains text predicates
+  // but no vector field). Such queries should block on in-flight mutations.
+  // Vector and hybrid queries should NOT block.
+  bool IsPureFullTextQuery() const {
+    // If it has a vector field, it's not a pure full-text query
+    if (IsVectorQuery()) {
+      return false;
+    }
+    // Must have a predicate with text predicates
+    if (!filter_parse_results.root_predicate) {
+      return false;
+    }
+    return filter_parse_results.root_predicate->HasTextPredicates();
+  }
+
   SearchParameters(uint64_t timeout, grpc::CallbackServerContext* context)
       : timeout_ms(timeout),
         cancellation_token(cancel::Make(timeout, context)) {}
