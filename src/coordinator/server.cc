@@ -45,8 +45,97 @@
 #include "vmsdk/src/type_conversions.h"
 #include "vmsdk/src/utils.h"
 #include "vmsdk/src/valkey_module_api/valkey_module.h"
+#include "src/query/predicate.h"
 
 namespace valkey_search::coordinator {
+
+// Retry interval in milliseconds for checking in-flight keys on shard
+constexpr mstime_t kShardInFlightKeyRetryIntervalMs = 10;
+
+// Context for retrying non-vector queries when keys are in-flight on a shard
+struct ShardNonVectorRetryContext {
+  std::unique_ptr<query::SearchParameters> parameters;
+  SearchIndexPartitionResponse* response;
+  grpc::ServerUnaryReactor* reactor;
+  std::unique_ptr<vmsdk::LatencySample> latency_sample;
+  std::deque<indexes::Neighbor> neighbors;
+  ValkeyModuleTimerID timer_id{0};
+};
+
+// Forward declaration
+void TryCompleteShardNonVectorQuery(ShardNonVectorRetryContext* retry_ctx);
+
+// Timer callback for retrying shard non-vector query processing
+void ShardNonVectorQueryRetryTimerCallback(ValkeyModuleCtx* ctx, void* data) {
+  auto* retry_ctx = static_cast<ShardNonVectorRetryContext*>(data);
+  retry_ctx->timer_id = 0;
+  TryCompleteShardNonVectorQuery(retry_ctx);
+}
+
+// Check if any neighbor keys are in-flight for a non-vector query on this shard.
+// If so, schedule a retry timer. Otherwise, complete the gRPC response.
+void TryCompleteShardNonVectorQuery(ShardNonVectorRetryContext* retry_ctx) {
+  // Check if the query has been cancelled/timed out
+  if (retry_ctx->parameters->cancellation_token->IsCancelled()) {
+    if (!valkey_search::options::GetEnablePartialResults().GetValue()) {
+      retry_ctx->reactor->Finish({grpc::StatusCode::DEADLINE_EXCEEDED,
+                                  "Search operation cancelled due to timeout"});
+      RecordSearchMetrics(true, std::move(retry_ctx->latency_sample));
+      delete retry_ctx;
+      return;
+    }
+    // Fall through to complete with partial results
+  }
+
+  // Check if any keys are in-flight
+  bool keys_in_flight = false;
+  if (retry_ctx->parameters->index_schema &&
+      retry_ctx->parameters->index_schema->GetTextIndexSchema() &&
+      query::ContainsTextPredicate(
+          retry_ctx->parameters->filter_parse_results.root_predicate.get())) {
+    for (const auto& neighbor : retry_ctx->neighbors) {
+      if (retry_ctx->parameters->index_schema->IsKeyInFlight(
+              neighbor.external_id)) {
+        keys_in_flight = true;
+        VMSDK_LOG(DEBUG, nullptr)
+            << "Shard: Key " << neighbor.external_id->Str()
+            << " is still in-flight, scheduling retry";
+        break;
+      }
+    }
+  }
+
+  if (keys_in_flight) {
+    // Schedule another retry timer
+    auto ctx = vmsdk::MakeUniqueValkeyThreadSafeContext(nullptr);
+    retry_ctx->timer_id = ValkeyModule_CreateTimer(
+        ctx.get(), kShardInFlightKeyRetryIntervalMs,
+        ShardNonVectorQueryRetryTimerCallback, retry_ctx);
+    if (retry_ctx->timer_id == 0) {
+      // Timer creation failed, proceed anyway
+      VMSDK_LOG(WARNING, nullptr)
+          << "Shard: Failed to create retry timer, proceeding with in-flight "
+             "keys";
+    } else {
+      return;  // Wait for timer
+    }
+  }
+
+  // No in-flight keys (or timeout/timer failure), complete the response
+  const auto& attribute_data_type =
+      retry_ctx->parameters->index_schema->GetAttributeDataType();
+  auto ctx = vmsdk::MakeUniqueValkeyThreadSafeContext(nullptr);
+
+  // Now process neighbors - all keys should be properly indexed
+  query::ProcessNonVectorNeighborsForReply(ctx.get(), attribute_data_type,
+                                           retry_ctx->neighbors,
+                                           *retry_ctx->parameters);
+
+  SerializeNeighbors(retry_ctx->response, retry_ctx->neighbors);
+  retry_ctx->reactor->Finish(grpc::Status::OK);
+  RecordSearchMetrics(false, std::move(retry_ctx->latency_sample));
+  delete retry_ctx;
+}
 
 CONTROLLED_SIZE_T(ForceRemoteFailCount, 0);
 CONTROLLED_SIZE_T(ForceIndexNotFoundError, 0);
@@ -150,29 +239,55 @@ grpc::ServerUnaryReactor* Service::SearchIndexPartition(
           reactor->Finish(grpc::Status::OK);
           RecordSearchMetrics(false, std::move(latency_sample));
         } else {
-          vmsdk::RunByMain([parameters = std::move(parameters), response,
-                            reactor, latency_sample = std::move(latency_sample),
-                            neighbors =
-                                std::move(neighbors.value())]() mutable {
-            const auto& attribute_data_type =
-                parameters->index_schema->GetAttributeDataType();
-            auto ctx = vmsdk::MakeUniqueValkeyThreadSafeContext(nullptr);
-            if (parameters->attribute_alias.empty()) {
-              query::ProcessNonVectorNeighborsForReply(
-                  ctx.get(), attribute_data_type, neighbors, *parameters);
-            } else {
-              auto vector_identifier =
-                  parameters->index_schema
-                      ->GetIdentifier(parameters->attribute_alias)
-                      .value();
-              query::ProcessNeighborsForReply(ctx.get(), attribute_data_type,
-                                              neighbors, *parameters,
-                                              vector_identifier);
-            }
-            SerializeNeighbors(response, neighbors);
-            reactor->Finish(grpc::Status::OK);
-            RecordSearchMetrics(false, std::move(latency_sample));
-          });
+          // Check if this is a non-vector query with text predicates that
+          // might need in-flight key handling
+          bool is_non_vector_with_text =
+              parameters->attribute_alias.empty() &&
+              parameters->index_schema &&
+              parameters->index_schema->GetTextIndexSchema() &&
+              query::ContainsTextPredicate(
+                  parameters->filter_parse_results.root_predicate.get());
+
+          if (is_non_vector_with_text) {
+            // Use the retry mechanism for non-vector queries with text
+            // predicates to wait for in-flight keys to be indexed
+            auto* retry_ctx = new ShardNonVectorRetryContext{
+                .parameters = std::move(parameters),
+                .response = response,
+                .reactor = reactor,
+                .latency_sample = std::move(latency_sample),
+                .neighbors = std::move(neighbors.value()),
+            };
+            vmsdk::RunByMain([retry_ctx]() {
+              TryCompleteShardNonVectorQuery(retry_ctx);
+            });
+          } else {
+            // Standard path for vector queries or non-vector without text
+            vmsdk::RunByMain([parameters = std::move(parameters), response,
+                              reactor,
+                              latency_sample = std::move(latency_sample),
+                              neighbors =
+                                  std::move(neighbors.value())]() mutable {
+              const auto& attribute_data_type =
+                  parameters->index_schema->GetAttributeDataType();
+              auto ctx = vmsdk::MakeUniqueValkeyThreadSafeContext(nullptr);
+              if (parameters->attribute_alias.empty()) {
+                query::ProcessNonVectorNeighborsForReply(
+                    ctx.get(), attribute_data_type, neighbors, *parameters);
+              } else {
+                auto vector_identifier =
+                    parameters->index_schema
+                        ->GetIdentifier(parameters->attribute_alias)
+                        .value();
+                query::ProcessNeighborsForReply(ctx.get(), attribute_data_type,
+                                                neighbors, *parameters,
+                                                vector_identifier);
+              }
+              SerializeNeighbors(response, neighbors);
+              reactor->Finish(grpc::Status::OK);
+              RecordSearchMetrics(false, std::move(latency_sample));
+            });
+          }
         }
       },
       query::SearchMode::kRemote);
