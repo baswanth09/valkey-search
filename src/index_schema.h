@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -178,6 +179,9 @@ class IndexSchema : public KeyspaceEventSubscription,
     };
     std::optional<absl::flat_hash_map<std::string, AttributeData>> attributes;
     std::vector<vmsdk::BlockedClient> blocked_clients;
+    // Generic completion callbacks for non-Valkey-client waiters (e.g., gRPC).
+    // These are invoked via RunByMain when the mutation completes.
+    std::vector<std::function<void()>> completion_callbacks;
     bool consume_in_progress{false};
     bool from_backfill{false};
     bool from_multi{false};
@@ -310,6 +314,15 @@ class IndexSchema : public KeyspaceEventSubscription,
   // Returns false if the key is no longer in-flight (mutation completed).
   bool AttachBlockedClientToInFlightKey(const InternedStringPtr &key,
                                         vmsdk::BlockedClient blocked_client)
+      ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
+
+  // Attaches a completion callback to an in-flight key's DocumentMutation.
+  // When the mutation completes, the callback will be invoked via RunByMain.
+  // This is used for non-Valkey-client waiters like gRPC handlers.
+  // Returns true if the key was in-flight and the callback was attached.
+  // Returns false if the key is no longer in-flight (mutation completed).
+  bool AttachCompletionCallbackToInFlightKey(
+      const InternedStringPtr &key, std::function<void()> callback)
       ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
 
   std::optional<MutatedAttributes> ConsumeTrackedMutatedAttribute(

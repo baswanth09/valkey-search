@@ -159,11 +159,9 @@ grpc::ServerUnaryReactor* Service::SearchIndexPartition(
             auto ctx = vmsdk::MakeUniqueValkeyThreadSafeContext(nullptr);
 
             // Create a callback to serialize and finish the gRPC response.
-            // Note: gRPC uses a thread-safe context which doesn't support
-            // ValkeyModule_BlockClient, so blocking for in-flight mutations
-            // is handled differently. For now, we process immediately and
-            // the in-flight blocking mechanism in ProcessNeighborsForReply
-            // will detect the thread-safe context and skip blocking.
+            // For gRPC, blocking uses completion callbacks instead of
+            // ValkeyModule_BlockClient. The callback will be invoked via
+            // RunByMain when in-flight mutations complete.
             auto send_response =
                 [response, reactor,
                  latency_sample = std::move(latency_sample)](
@@ -188,8 +186,9 @@ grpc::ServerUnaryReactor* Service::SearchIndexPartition(
                                               vector_identifier,
                                               std::move(send_response));
             }
-            // Note: The send_response callback is always invoked synchronously
-            // for gRPC because blocking is not supported with thread-safe ctx.
+            // Note: If blocking is needed, ProcessNeighborsForReply will return
+            // kBlocked and the send_response callback will be invoked later
+            // via RunByMain when the in-flight mutation completes.
           });
         }
       },

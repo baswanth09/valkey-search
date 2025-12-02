@@ -405,31 +405,29 @@ absl::StatusOr<RecordsMap> GetContent(
   return return_content;
 }
 
-// Helper to check if blocking for in-flight mutations is required.
-// Returns true for non-vector queries that contain text predicates and
-// when the client supports blocking (i.e., is a real user client, not a
-// thread-safe context).
-bool ShouldBlockForInFlightMutations(
-    ValkeyModuleCtx *ctx, const query::SearchParameters &parameters) {
-  // Only block for real user clients (not thread-safe contexts used by gRPC)
-  // Thread-safe contexts don't support ValkeyModule_BlockClient properly.
-  if (!vmsdk::IsRealUserClient(ctx)) {
-    return false;
-  }
-
-  // Only block for non-vector queries (pure text or text+tag/numeric)
+// Helper to check if blocking for in-flight mutations is required based on
+// query type only. Returns true for non-vector queries with text predicates.
+bool IsTextQueryRequiringInFlightCheck(
+    const query::SearchParameters &parameters) {
+  // Only for non-vector queries (pure text or text+tag/numeric)
   if (!parameters.IsNonVectorQuery()) {
     return false;
   }
 
-  // Only block if the query has text predicates
+  // Only if the query has text predicates
   return parameters.filter_parse_results.root_predicate != nullptr &&
          ContainsTextPredicate(
              parameters.filter_parse_results.root_predicate.get());
 }
 
+// Helper to check if we can use Valkey's BlockedClient mechanism.
+// Returns true for real user clients (not thread-safe contexts like gRPC).
+bool CanUseValkeyBlocking(ValkeyModuleCtx *ctx) {
+  return vmsdk::IsRealUserClient(ctx);
+}
+
 // Core implementation of ProcessNeighborsForReply that handles in-flight
-// blocking.
+// blocking for both Valkey clients and gRPC handlers.
 ProcessNeighborsStatus ProcessNeighborsForReplyImpl(
     ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
     std::deque<indexes::Neighbor> &neighbors,
@@ -437,7 +435,7 @@ ProcessNeighborsStatus ProcessNeighborsForReplyImpl(
     std::function<void(ValkeyModuleCtx *, std::deque<indexes::Neighbor> &)>
         send_response) {
   // For text queries, check for in-flight mutations before processing.
-  if (ShouldBlockForInFlightMutations(ctx, parameters) && parameters.index_schema) {
+  if (IsTextQueryRequiringInFlightCheck(parameters) && parameters.index_schema) {
     // Extract all neighbor keys that need to be checked
     std::vector<InternedStringPtr> neighbor_keys;
     neighbor_keys.reserve(neighbors.size());
@@ -458,48 +456,91 @@ ProcessNeighborsStatus ProcessNeighborsForReplyImpl(
             << "Text query blocking for " << in_flight_keys.size()
             << " in-flight keys";
 
-        // Create state for the blocked client callback
-        auto *state = new InFlightWaitState();
-        state->neighbors = std::move(neighbors);
-        state->index_schema = parameters.index_schema;
-        state->attribute_data_type = attribute_data_type.Clone();
-        state->identifier = identifier;
-        state->send_response = std::move(send_response);
-        state->filter_parse_results = parameters.filter_parse_results;
-        state->return_attributes = parameters.return_attributes;
+        if (CanUseValkeyBlocking(ctx)) {
+          // For real Valkey clients, use BlockedClient mechanism
+          auto *state = new InFlightWaitState();
+          state->neighbors = std::move(neighbors);
+          state->index_schema = parameters.index_schema;
+          state->attribute_data_type = attribute_data_type.Clone();
+          state->identifier = identifier;
+          state->send_response = std::move(send_response);
+          state->filter_parse_results = parameters.filter_parse_results;
+          state->return_attributes = parameters.return_attributes;
 
-        // Create blocked client with callback
-        int64_t timeout_ms =
-            options::GetTextQueryInFlightWaitTimeoutMs().GetValue();
-        vmsdk::BlockedClient blocked_client(
-            ctx, InFlightReplyCallback, InFlightTimeoutCallback,
-            InFlightFreeCallback, timeout_ms);
-        blocked_client.SetReplyPrivateData(state);
-        blocked_client.MeasureTimeStart();
+          int64_t timeout_ms =
+              options::GetTextQueryInFlightWaitTimeoutMs().GetValue();
+          vmsdk::BlockedClient blocked_client(
+              ctx, InFlightReplyCallback, InFlightTimeoutCallback,
+              InFlightFreeCallback, timeout_ms);
+          blocked_client.SetReplyPrivateData(state);
+          blocked_client.MeasureTimeStart();
 
-        // Attach to the first in-flight key's DocumentMutation.
-        // When that mutation completes, our client will be unblocked.
-        // The callback will re-check all keys in case there are still conflicts.
-        bool attached = parameters.index_schema->AttachBlockedClientToInFlightKey(
-            in_flight_keys[0], std::move(blocked_client));
+          // Attach to the first in-flight key's DocumentMutation.
+          bool attached =
+              parameters.index_schema->AttachBlockedClientToInFlightKey(
+                  in_flight_keys[0], std::move(blocked_client));
 
-        if (attached) {
-          ++Metrics::GetStats().text_query_inflight_wait_success_cnt;
-          return ProcessNeighborsStatus::kBlocked;
+          if (attached) {
+            ++Metrics::GetStats().text_query_inflight_wait_success_cnt;
+            return ProcessNeighborsStatus::kBlocked;
+          }
+
+          // Attach failed (key completed between check and attach).
+          // Recover state and process normally. State will be freed by
+          // InFlightFreeCallback when blocked_client goes out of scope.
+          VMSDK_LOG(DEBUG, ctx) << "In-flight key completed during attach, "
+                                   "proceeding with processing";
+          neighbors = std::move(state->neighbors);
+          send_response = std::move(state->send_response);
+        } else {
+          // For gRPC/thread-safe contexts, use completion callback mechanism.
+          // We need to be careful not to lose data if attach fails.
+
+          // First, try to attach a callback. We'll capture shared_ptr to state
+          // so we can check if attach succeeded before moving data.
+          auto state = std::make_shared<InFlightWaitState>();
+          state->index_schema = parameters.index_schema;
+          state->attribute_data_type = attribute_data_type.Clone();
+          state->identifier = identifier;
+          state->filter_parse_results = parameters.filter_parse_results;
+          state->return_attributes = parameters.return_attributes;
+          // Don't move neighbors/send_response yet - we need them if attach
+          // fails
+
+          auto completion_callback = [state]() {
+            // This runs on the main thread via RunByMain
+            auto ctx = vmsdk::MakeUniqueValkeyThreadSafeContext(nullptr);
+
+            // Reconstruct SearchParameters from the stored state
+            query::SearchParameters params;
+            params.index_schema = state->index_schema;
+            params.filter_parse_results =
+                std::move(state->filter_parse_results);
+            params.return_attributes = std::move(state->return_attributes);
+
+            // Re-invoke processing (may block again if still conflicts)
+            ProcessNeighborsForReplyImpl(
+                ctx.get(), *state->attribute_data_type, state->neighbors,
+                params, state->identifier, std::move(state->send_response));
+          };
+
+          bool attached =
+              parameters.index_schema->AttachCompletionCallbackToInFlightKey(
+                  in_flight_keys[0], std::move(completion_callback));
+
+          if (attached) {
+            // Now safe to move data into state
+            state->neighbors = std::move(neighbors);
+            state->send_response = std::move(send_response);
+            ++Metrics::GetStats().text_query_inflight_wait_success_cnt;
+            return ProcessNeighborsStatus::kBlocked;
+          }
+
+          // Attach failed - state shared_ptr will be destroyed, but we
+          // still have neighbors and send_response. Fall through to process.
+          VMSDK_LOG(DEBUG, ctx) << "In-flight key completed during attach, "
+                                   "proceeding with processing";
         }
-
-        // If attach failed (key completed between check and attach), fall
-        // through and process normally. The state will be cleaned up when
-        // blocked_client goes out of scope and unblocks, which will trigger
-        // InFlightFreeCallback.
-        VMSDK_LOG(DEBUG, ctx) << "In-flight key completed during attach, "
-                                 "proceeding with processing";
-
-        // Recover the state since we're not blocking
-        neighbors = std::move(state->neighbors);
-        send_response = std::move(state->send_response);
-        // Note: state will be freed by InFlightFreeCallback when blocked_client
-        // is destroyed
       }
     }
   }

@@ -1252,6 +1252,20 @@ bool IndexSchema::AttachBlockedClientToInFlightKey(
   return true;
 }
 
+bool IndexSchema::AttachCompletionCallbackToInFlightKey(
+    const InternedStringPtr &key, std::function<void()> callback) {
+  absl::MutexLock lock(&mutated_records_mutex_);
+  auto itr = tracked_mutated_records_.find(key);
+  if (itr == tracked_mutated_records_.end()) {
+    // Key is no longer in-flight (mutation completed between check and attach)
+    return false;
+  }
+  // Attach the completion callback to this mutation. When the mutation
+  // completes, the callback will be invoked via RunByMain.
+  itr->second.completion_callbacks.emplace_back(std::move(callback));
+  return true;
+}
+
 bool IndexSchema::InTrackedMutationRecords(
     const InternedStringPtr &key, const std::string &identifier) const {
   absl::MutexLock lock(&mutated_records_mutex_);
@@ -1332,24 +1346,39 @@ void IndexSchema::MarkAsDestructing() {
 std::optional<IndexSchema::MutatedAttributes>
 IndexSchema::ConsumeTrackedMutatedAttribute(const InternedStringPtr &key,
                                             bool first_time) {
-  absl::MutexLock lock(&mutated_records_mutex_);
-  auto itr = tracked_mutated_records_.find(key);
-  if (ABSL_PREDICT_FALSE(itr == tracked_mutated_records_.end())) {
-    return std::nullopt;
+  std::vector<std::function<void()>> callbacks_to_invoke;
+  {
+    absl::MutexLock lock(&mutated_records_mutex_);
+    auto itr = tracked_mutated_records_.find(key);
+    if (ABSL_PREDICT_FALSE(itr == tracked_mutated_records_.end())) {
+      return std::nullopt;
+    }
+    if (ABSL_PREDICT_FALSE(first_time && itr->second.consume_in_progress)) {
+      return std::nullopt;
+    }
+    itr->second.consume_in_progress = true;
+    // Delete this tracked document if no additional mutations were tracked
+    if (!itr->second.attributes.has_value()) {
+      // Extract completion callbacks before erasing (they'll be invoked below)
+      callbacks_to_invoke = std::move(itr->second.completion_callbacks);
+      // Erasing will destroy DocumentMutation, triggering BlockedClient
+      // destructors which unblock Valkey clients
+      tracked_mutated_records_.erase(itr);
+      // Note: We invoke completion_callbacks outside the lock below
+    } else {
+      // Track entry is now first consumed
+      auto mutated_attributes = std::move(itr->second.attributes.value());
+      itr->second.attributes = std::nullopt;
+      return mutated_attributes;
+    }
   }
-  if (ABSL_PREDICT_FALSE(first_time && itr->second.consume_in_progress)) {
-    return std::nullopt;
+
+  // Invoke completion callbacks outside the lock via RunByMain.
+  // These are for non-Valkey-client waiters like gRPC handlers.
+  for (auto &callback : callbacks_to_invoke) {
+    vmsdk::RunByMain(std::move(callback));
   }
-  itr->second.consume_in_progress = true;
-  // Delete this tracked document if no additional mutations were tracked
-  if (!itr->second.attributes.has_value()) {
-    tracked_mutated_records_.erase(itr);
-    return std::nullopt;
-  }
-  // Track entry is now first consumed
-  auto mutated_attributes = std::move(itr->second.attributes.value());
-  itr->second.attributes = std::nullopt;
-  return mutated_attributes;
+  return std::nullopt;
 }
 
 size_t IndexSchema::GetMutatedRecordsSize() const {
