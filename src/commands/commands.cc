@@ -7,11 +7,14 @@
 
 #include "src/commands/commands.h"
 
+#include <optional>
+
 #include "fanout.h"
 #include "ft_create_parser.h"
 #include "src/acl.h"
 #include "src/commands/ft_search.h"
 #include "src/query/search.h"
+#include "src/query/text_ingestion_awaiter.h"
 #include "src/schema_manager.h"
 #include "src/valkey_search.h"
 #include "valkey_search_options.h"
@@ -61,6 +64,41 @@ void Free([[maybe_unused]] ValkeyModuleCtx *ctx, void *privdata) {
 }
 
 }  // namespace async
+
+namespace {
+
+struct PendingSearchReply {
+  std::optional<vmsdk::BlockedClient> blocked_client;
+  absl::StatusOr<std::deque<indexes::Neighbor>> neighbors;
+  std::unique_ptr<QueryCommand> parameters;
+  std::shared_ptr<query::TextMutationAwaiter> waiter;
+
+  PendingSearchReply(vmsdk::BlockedClient blocked_client_in,
+                     absl::StatusOr<std::deque<indexes::Neighbor>> neighbors_in,
+                     std::unique_ptr<QueryCommand> parameters_in)
+      : blocked_client(std::move(blocked_client_in)),
+        neighbors(std::move(neighbors_in)),
+        parameters(std::move(parameters_in)) {}
+
+  void Reply() {
+    if (!blocked_client.has_value()) {
+      return;
+    }
+    auto result = std::make_unique<async::Result>(async::Result{
+        .neighbors = std::move(neighbors),
+        .parameters = std::move(parameters),
+    });
+    blocked_client->SetReplyPrivateData(result.release());
+    blocked_client.reset();
+  }
+
+  void ReplyWithStatus(absl::Status status) {
+    neighbors = std::move(status);
+    Reply();
+  }
+};
+
+}  // namespace
 
 CONTROLLED_BOOLEAN(ForceReplicasOnly, false);
 
@@ -113,17 +151,60 @@ absl::Status QueryCommand::Execute(ValkeyModuleCtx *ctx,
     vmsdk::BlockedClient blocked_client(ctx, async::Reply, async::Timeout,
                                         async::Free, parameters->timeout_ms);
     blocked_client.MeasureTimeStart();
-    auto on_done_callback = [blocked_client = std::move(blocked_client)](
-                                auto &neighbors, auto parameters) mutable {
-      std::unique_ptr<QueryCommand> upcast_parameters(
-          dynamic_cast<QueryCommand *>(parameters.release()));
-      CHECK(upcast_parameters != nullptr);
-      auto result = std::make_unique<async::Result>(async::Result{
-          .neighbors = std::move(neighbors),
-          .parameters = std::move(upcast_parameters),
-      });
-      blocked_client.SetReplyPrivateData(result.release());
-    };
+    auto on_done_callback =
+        [blocked_client = std::move(blocked_client)](
+            auto &neighbors, auto parameters) mutable {
+          std::unique_ptr<QueryCommand> upcast_parameters(
+              dynamic_cast<QueryCommand *>(parameters.release()));
+          CHECK(upcast_parameters != nullptr);
+          auto pending = std::make_shared<PendingSearchReply>(
+              std::move(blocked_client), std::move(neighbors),
+              std::move(upcast_parameters));
+          if (!pending->neighbors.ok()) {
+            pending->Reply();
+            return;
+          }
+          if (!query::ShouldBlockOnTextPredicates(*pending->parameters) ||
+              !pending->parameters->index_schema) {
+            pending->Reply();
+            return;
+          }
+          auto conflicts = query::CollectConflictingKeys(
+              *pending->parameters, pending->neighbors.value());
+          if (conflicts.empty()) {
+            pending->Reply();
+            return;
+          }
+          auto scheduler = ValkeySearch::Instance().GetReaderThreadPool();
+          CHECK(scheduler != nullptr);
+          auto weak_schema = pending->parameters->index_schema;
+          query::ConflictSupplier conflict_supplier =
+              [pending]() -> std::vector<InternedStringPtr> {
+            return query::CollectConflictingKeys(*pending->parameters,
+                                                 pending->neighbors.value());
+          };
+          query::RegisterWaiterFn register_waiter =
+              [weak_schema](
+                  const InternedStringPtr &key,
+                  const std::shared_ptr<query::TextIngestionWaiter> &waiter) {
+                if (auto schema = weak_schema.lock()) {
+                  schema->RegisterTextIngestionWaiter(key, waiter);
+                } else {
+                  waiter->OnKeySettled(key);
+                }
+              };
+          query::CompletionCallback on_ready =
+              [pending]() { pending->Reply(); };
+          query::FailureCallback on_failure =
+              [pending](absl::Status status) {
+                pending->ReplyWithStatus(std::move(status));
+              };
+          pending->waiter = std::make_shared<query::TextMutationAwaiter>(
+              std::move(conflict_supplier), std::move(register_waiter),
+              pending->parameters->cancellation_token, scheduler,
+              std::move(on_ready), std::move(on_failure));
+          pending->waiter->Start();
+        };
 
     if (ValkeySearch::Instance().UsingCoordinator() &&
         ValkeySearch::Instance().IsCluster() && !parameters->local_only) {

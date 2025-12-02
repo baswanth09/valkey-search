@@ -38,6 +38,7 @@
 #include "src/indexes/tag.h"
 #include "src/indexes/text.h"
 #include "src/indexes/text/text_index.h"
+#include "src/query/text_ingestion_waiter.h"
 #include "src/indexes/vector_base.h"
 #include "src/indexes/vector_flat.h"
 #include "src/indexes/vector_hnsw.h"
@@ -1289,40 +1290,72 @@ bool IndexSchema::TrackMutatedRecord(ValkeyModuleCtx *ctx,
 }
 
 void IndexSchema::MarkAsDestructing() {
-  absl::MutexLock lock(&mutated_records_mutex_);
-  auto status = keyspace_event_manager_->RemoveSubscription(this);
-  if (!status.ok()) {
-    VMSDK_LOG(WARNING, detached_ctx_.get())
-        << "Failed to remove keyspace event subscription for index "
-           "schema "
-        << name_ << ": " << status.message();
+  std::vector<std::pair<std::shared_ptr<query::TextIngestionWaiter>,
+                        InternedStringPtr>>
+      waiters_to_notify;
+  {
+    absl::MutexLock lock(&mutated_records_mutex_);
+    auto status = keyspace_event_manager_->RemoveSubscription(this);
+    if (!status.ok()) {
+      VMSDK_LOG(WARNING, detached_ctx_.get())
+          << "Failed to remove keyspace event subscription for index "
+             "schema "
+          << name_ << ": " << status.message();
+    }
+    for (auto &[key, mutation] : tracked_mutated_records_) {
+      for (auto &weak_waiter : mutation.text_waiters) {
+        if (auto waiter = weak_waiter.lock()) {
+          waiters_to_notify.emplace_back(waiter, key);
+        }
+      }
+      mutation.text_waiters.clear();
+    }
+    backfill_job_.Get()->MarkScanAsDone();
+    tracked_mutated_records_.clear();
+    is_destructing_ = true;
   }
-  backfill_job_.Get()->MarkScanAsDone();
-  tracked_mutated_records_.clear();
-  is_destructing_ = true;
+  for (auto &[waiter, key] : waiters_to_notify) {
+    waiter->OnKeySettled(key);
+  }
 }
 
 std::optional<IndexSchema::MutatedAttributes>
 IndexSchema::ConsumeTrackedMutatedAttribute(const InternedStringPtr &key,
                                             bool first_time) {
-  absl::MutexLock lock(&mutated_records_mutex_);
-  auto itr = tracked_mutated_records_.find(key);
-  if (ABSL_PREDICT_FALSE(itr == tracked_mutated_records_.end())) {
+  std::vector<std::shared_ptr<query::TextIngestionWaiter>> waiters_to_notify;
+  bool erased_entry = false;
+  {
+    absl::MutexLock lock(&mutated_records_mutex_);
+    auto itr = tracked_mutated_records_.find(key);
+    if (ABSL_PREDICT_FALSE(itr == tracked_mutated_records_.end())) {
+      return std::nullopt;
+    }
+    if (ABSL_PREDICT_FALSE(first_time && itr->second.consume_in_progress)) {
+      return std::nullopt;
+    }
+    itr->second.consume_in_progress = true;
+    if (!itr->second.attributes.has_value()) {
+      for (auto &weak_waiter : itr->second.text_waiters) {
+        if (auto waiter = weak_waiter.lock()) {
+          waiters_to_notify.push_back(std::move(waiter));
+        }
+      }
+      itr->second.text_waiters.clear();
+      tracked_mutated_records_.erase(itr);
+      erased_entry = true;
+    } else {
+      auto mutated_attributes = std::move(itr->second.attributes.value());
+      itr->second.attributes = std::nullopt;
+      return mutated_attributes;
+    }
+  }
+  for (auto &waiter : waiters_to_notify) {
+    waiter->OnKeySettled(key);
+  }
+  if (erased_entry) {
     return std::nullopt;
   }
-  if (ABSL_PREDICT_FALSE(first_time && itr->second.consume_in_progress)) {
-    return std::nullopt;
-  }
-  itr->second.consume_in_progress = true;
-  // Delete this tracked document if no additional mutations were tracked
-  if (!itr->second.attributes.has_value()) {
-    tracked_mutated_records_.erase(itr);
-    return std::nullopt;
-  }
-  // Track entry is now first consumed
-  auto mutated_attributes = std::move(itr->second.attributes.value());
-  itr->second.attributes = std::nullopt;
-  return mutated_attributes;
+  return std::nullopt;
 }
 
 size_t IndexSchema::GetMutatedRecordsSize() const {
@@ -1333,6 +1366,24 @@ size_t IndexSchema::GetMutatedRecordsSize() const {
 void IndexSchema::SubscribeToVectorExternalizer(
     absl::string_view attribute_identifier, indexes::VectorBase *vector_index) {
   vector_externalizer_subscriptions_[attribute_identifier] = vector_index;
+}
+
+void IndexSchema::RegisterTextIngestionWaiter(
+    const InternedStringPtr &key,
+    const std::shared_ptr<query::TextIngestionWaiter> &waiter) {
+  std::vector<std::shared_ptr<query::TextIngestionWaiter>> ready_waiters;
+  {
+    absl::MutexLock lock(&mutated_records_mutex_);
+    auto itr = tracked_mutated_records_.find(key);
+    if (itr == tracked_mutated_records_.end()) {
+      ready_waiters.push_back(waiter);
+    } else {
+      itr->second.text_waiters.emplace_back(waiter);
+    }
+  }
+  for (auto &ready_waiter : ready_waiters) {
+    ready_waiter->OnKeySettled(key);
+  }
 }
 
 void IndexSchema::VectorExternalizer(const InternedStringPtr &key,

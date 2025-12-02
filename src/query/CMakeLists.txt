@@ -82,6 +82,18 @@ target_link_libraries(response_generator PUBLIC vector_base)
 target_link_libraries(response_generator PUBLIC vmsdklib)
 target_link_libraries(response_generator PUBLIC valkey_module)
 
+set(SRCS_TEXT_INGESTION ${CMAKE_CURRENT_LIST_DIR}/text_ingestion_awaiter.cc
+                        ${CMAKE_CURRENT_LIST_DIR}/text_ingestion_awaiter.h
+                        ${CMAKE_CURRENT_LIST_DIR}/text_ingestion_waiter.h)
+
+valkey_search_add_static_library(text_ingestion "${SRCS_TEXT_INGESTION}")
+target_include_directories(text_ingestion PUBLIC ${CMAKE_CURRENT_LIST_DIR})
+target_link_libraries(text_ingestion PUBLIC predicate_header)
+target_link_libraries(text_ingestion PUBLIC search_header)
+target_link_libraries(text_ingestion PUBLIC index_schema)
+target_link_libraries(text_ingestion PUBLIC vector_base)
+target_link_libraries(text_ingestion PUBLIC vmsdklib)
+
 set(SRCS_PLANNER ${CMAKE_CURRENT_LIST_DIR}/planner.cc
                  ${CMAKE_CURRENT_LIST_DIR}/planner.h)
 

@@ -366,6 +366,8 @@ class ComposedPredicate : public Predicate {
   bool inorder_;
 };
 
+bool ContainsTextPredicate(const Predicate* predicate);
+
 }  // namespace valkey_search::query
 
 #endif  // VALKEYSEARCH_SRC_QUERY_PREDICATE_H_

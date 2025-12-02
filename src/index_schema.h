@@ -45,6 +45,9 @@
 #include "vmsdk/src/valkey_module_api/valkey_module.h"
 
 namespace valkey_search {
+namespace query {
+class TextIngestionWaiter;
+}  // namespace query
 bool ShouldBlockClient(ValkeyModuleCtx *ctx, bool inside_multi_exec,
                        bool from_backfill);
 
@@ -178,6 +181,7 @@ class IndexSchema : public KeyspaceEventSubscription,
     };
     std::optional<absl::flat_hash_map<std::string, AttributeData>> attributes;
     std::vector<vmsdk::BlockedClient> blocked_clients;
+    std::vector<std::weak_ptr<query::TextIngestionWaiter>> text_waiters;
     bool consume_in_progress{false};
     bool from_backfill{false};
     bool from_multi{false};
@@ -191,6 +195,10 @@ class IndexSchema : public KeyspaceEventSubscription,
   void ProcessMultiQueue();
   void SubscribeToVectorExternalizer(absl::string_view attribute_identifier,
                                      indexes::VectorBase *vector_index);
+  void RegisterTextIngestionWaiter(
+      const InternedStringPtr &key,
+      const std::shared_ptr<query::TextIngestionWaiter> &waiter)
+      ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
   uint64_t GetBackfillScannedKeyCount() const;
   uint64_t GetBackfillDbSize() const;
   InfoIndexPartitionData GetInfoIndexPartitionData() const;

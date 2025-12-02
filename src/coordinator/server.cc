@@ -35,6 +35,7 @@
 #include "src/query/fanout_operation_base.h"
 #include "src/query/response_generator.h"
 #include "src/query/search.h"
+#include "src/query/text_ingestion_awaiter.h"
 #include "src/schema_manager.h"
 #include "valkey_search_options.h"
 #include "vmsdk/src/debug.h"
@@ -95,6 +96,66 @@ void RecordSearchMetrics(bool failure,
   }
 }
 
+namespace {
+
+struct PendingShardResponse {
+  SearchIndexPartitionResponse* response;
+  grpc::ServerUnaryReactor* reactor;
+  std::unique_ptr<query::SearchParameters> parameters;
+  std::deque<indexes::Neighbor> neighbors;
+  std::unique_ptr<vmsdk::StopWatch> latency_sample;
+  std::shared_ptr<query::TextMutationAwaiter> waiter;
+
+  PendingShardResponse(SearchIndexPartitionResponse* resp,
+                       grpc::ServerUnaryReactor* react,
+                       std::unique_ptr<query::SearchParameters> params,
+                       std::deque<indexes::Neighbor> neighbors_in,
+                       std::unique_ptr<vmsdk::StopWatch> sample)
+      : response(resp),
+        reactor(react),
+        parameters(std::move(params)),
+        neighbors(std::move(neighbors_in)),
+        latency_sample(std::move(sample)) {}
+
+  void FinishSuccess() {
+    auto response_ptr = response;
+    auto reactor_ptr = reactor;
+    auto latency = std::move(latency_sample);
+    auto neighbors_local = std::move(neighbors);
+    vmsdk::RunByMain(
+        [parameters = std::move(parameters), response_ptr, reactor_ptr,
+         latency_sample = std::move(latency),
+         neighbors = std::move(neighbors_local)]() mutable {
+          const auto& attribute_data_type =
+              parameters->index_schema->GetAttributeDataType();
+          auto ctx = vmsdk::MakeUniqueValkeyThreadSafeContext(nullptr);
+          if (parameters->attribute_alias.empty()) {
+            query::ProcessNonVectorNeighborsForReply(ctx.get(),
+                                                     attribute_data_type,
+                                                     neighbors, *parameters);
+          } else {
+            auto vector_identifier =
+                parameters->index_schema
+                    ->GetIdentifier(parameters->attribute_alias)
+                    .value();
+            query::ProcessNeighborsForReply(ctx.get(), attribute_data_type,
+                                            neighbors, *parameters,
+                                            vector_identifier);
+          }
+          SerializeNeighbors(response_ptr, neighbors);
+          reactor_ptr->Finish(grpc::Status::OK);
+          RecordSearchMetrics(false, std::move(latency_sample));
+        });
+  }
+
+  void FinishFailure(const absl::Status& status) {
+    reactor->Finish(ToGrpcStatus(status));
+    RecordSearchMetrics(true, std::move(latency_sample));
+  }
+};
+
+}  // namespace
+
 void SerializeNeighbors(SearchIndexPartitionResponse* response,
                         const std::deque<indexes::Neighbor>& neighbors) {
   for (const auto& neighbor : neighbors) {
@@ -130,7 +191,7 @@ grpc::ServerUnaryReactor* Service::SearchIndexPartition(
   // Enqueue into the thread pool
   auto status = query::SearchAsync(
       std::move(*vector_search_parameters), reader_thread_pool_,
-      [response, reactor, latency_sample = std::move(latency_sample)](
+      [this, response, reactor, latency_sample = std::move(latency_sample)](
           auto& neighbors,
           std::unique_ptr<query::SearchParameters> parameters) mutable {
         if (!neighbors.ok()) {
@@ -145,15 +206,18 @@ grpc::ServerUnaryReactor* Service::SearchIndexPartition(
           RecordSearchMetrics(true, std::move(latency_sample));
           return;
         }
+        auto neighbor_list = std::move(neighbors.value());
         if (parameters->no_content) {
-          SerializeNeighbors(response, neighbors.value());
+          SerializeNeighbors(response, neighbor_list);
           reactor->Finish(grpc::Status::OK);
           RecordSearchMetrics(false, std::move(latency_sample));
-        } else {
+          return;
+        }
+        if (!query::ShouldBlockOnTextPredicates(*parameters) ||
+            !parameters->index_schema) {
           vmsdk::RunByMain([parameters = std::move(parameters), response,
                             reactor, latency_sample = std::move(latency_sample),
-                            neighbors =
-                                std::move(neighbors.value())]() mutable {
+                            neighbors = std::move(neighbor_list)]() mutable {
             const auto& attribute_data_type =
                 parameters->index_schema->GetAttributeDataType();
             auto ctx = vmsdk::MakeUniqueValkeyThreadSafeContext(nullptr);
@@ -173,7 +237,65 @@ grpc::ServerUnaryReactor* Service::SearchIndexPartition(
             reactor->Finish(grpc::Status::OK);
             RecordSearchMetrics(false, std::move(latency_sample));
           });
+          return;
         }
+        auto conflicts =
+            query::CollectConflictingKeys(*parameters, neighbor_list);
+        if (conflicts.empty()) {
+          vmsdk::RunByMain([parameters = std::move(parameters), response,
+                            reactor, latency_sample = std::move(latency_sample),
+                            neighbors = std::move(neighbor_list)]() mutable {
+            const auto& attribute_data_type =
+                parameters->index_schema->GetAttributeDataType();
+            auto ctx = vmsdk::MakeUniqueValkeyThreadSafeContext(nullptr);
+            if (parameters->attribute_alias.empty()) {
+              query::ProcessNonVectorNeighborsForReply(
+                  ctx.get(), attribute_data_type, neighbors, *parameters);
+            } else {
+              auto vector_identifier =
+                  parameters->index_schema
+                      ->GetIdentifier(parameters->attribute_alias)
+                      .value();
+              query::ProcessNeighborsForReply(ctx.get(), attribute_data_type,
+                                              neighbors, *parameters,
+                                              vector_identifier);
+            }
+            SerializeNeighbors(response, neighbors);
+            reactor->Finish(grpc::Status::OK);
+            RecordSearchMetrics(false, std::move(latency_sample));
+          });
+          return;
+        }
+        auto pending = std::make_shared<PendingShardResponse>(
+            response, reactor, std::move(parameters),
+            std::move(neighbor_list), std::move(latency_sample));
+        auto weak_schema = pending->parameters->index_schema;
+        query::ConflictSupplier conflict_supplier =
+            [pending]() -> std::vector<InternedStringPtr> {
+          return query::CollectConflictingKeys(*pending->parameters,
+                                               pending->neighbors);
+        };
+        query::RegisterWaiterFn register_waiter =
+            [weak_schema](
+                const InternedStringPtr& key,
+                const std::shared_ptr<query::TextIngestionWaiter>& waiter) {
+              if (auto schema = weak_schema.lock()) {
+                schema->RegisterTextIngestionWaiter(key, waiter);
+              } else {
+                waiter->OnKeySettled(key);
+              }
+            };
+        query::CompletionCallback on_ready =
+            [pending]() { pending->FinishSuccess(); };
+        query::FailureCallback on_failure = [pending](absl::Status status) {
+          pending->FinishFailure(status);
+        };
+        pending->waiter = std::make_shared<query::TextMutationAwaiter>(
+            std::move(conflict_supplier), std::move(register_waiter),
+            pending->parameters->cancellation_token, reader_thread_pool_,
+            std::move(on_ready), std::move(on_failure));
+        pending->waiter->Start();
+        return;
       },
       query::SearchMode::kRemote);
   if (!status.ok()) {
