@@ -165,9 +165,39 @@ void SearchCommand::SendReply(ValkeyModuleCtx *ctx,
 
   // Support non-vector queries: no attribute_alias and k == 0
   if (IsNonVectorQuery()) {
-    query::ProcessNonVectorNeighborsForReply(
-        ctx, index_schema->GetAttributeDataType(), neighbors, *this);
-    SerializeNonVectorNeighbors(ctx, neighbors, *this);
+    // Create a callback to serialize the response when processing completes.
+    // Note: SerializeNonVectorNeighbors doesn't use the parameters argument,
+    // so we don't need to capture 'this'. This is important because if
+    // blocking occurs, the callback may be invoked after 'this' is destroyed.
+    auto send_response = [](ValkeyModuleCtx *reply_ctx,
+                            std::deque<indexes::Neighbor> &result) {
+      // Inline serialization logic (doesn't depend on SearchCommand)
+      const size_t available_results = result.size();
+      ValkeyModule_ReplyWithArray(reply_ctx, 2 * available_results + 1);
+      ValkeyModule_ReplyWithLongLong(reply_ctx, available_results);
+      for (const auto &neighbor : result) {
+        ValkeyModule_ReplyWithString(
+            reply_ctx,
+            vmsdk::MakeUniqueValkeyString(*neighbor.external_id).get());
+        const auto &contents = neighbor.attribute_contents.value();
+        ValkeyModule_ReplyWithArray(reply_ctx, 2 * contents.size());
+        for (const auto &attribute_content : contents) {
+          ValkeyModule_ReplyWithString(
+              reply_ctx, attribute_content.second.GetIdentifier());
+          ValkeyModule_ReplyWithString(reply_ctx,
+                                       attribute_content.second.value.get());
+        }
+      }
+    };
+
+    query::ProcessNeighborsStatus status =
+        query::ProcessNonVectorNeighborsForReply(
+            ctx, index_schema->GetAttributeDataType(), neighbors, *this,
+            send_response);
+
+    // If blocked, the callback will handle the response later.
+    // If complete, the callback has already sent the response.
+    (void)status;  // Status is handled internally by the callback
     return;
   }
 
@@ -186,10 +216,20 @@ void SearchCommand::SendReply(ValkeyModuleCtx *ctx,
     ValkeyModule_ReplyWithError(ctx, identifier.status().message().data());
     return;
   }
-  query::ProcessNeighborsForReply(ctx, index_schema->GetAttributeDataType(),
-                                  neighbors, *this, identifier.value());
 
-  SerializeNeighbors(ctx, neighbors, *this);
+  // Create a callback to serialize the response when processing completes.
+  auto send_response = [this](ValkeyModuleCtx *reply_ctx,
+                              std::deque<indexes::Neighbor> &result) {
+    SerializeNeighbors(reply_ctx, result, *this);
+  };
+
+  query::ProcessNeighborsStatus status = query::ProcessNeighborsForReply(
+      ctx, index_schema->GetAttributeDataType(), neighbors, *this,
+      identifier.value(), send_response);
+
+  // If blocked, the callback will handle the response later.
+  // If complete, the callback has already sent the response.
+  (void)status;  // Status is handled internally by the callback
 }
 
 absl::Status FTSearchCmd(ValkeyModuleCtx *ctx, ValkeyModuleString **argv,

@@ -9,9 +9,10 @@
 
 #include <algorithm>
 #include <deque>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -20,8 +21,6 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
-#include "absl/time/clock.h"
-#include "absl/time/time.h"
 #include "src/attribute_data_type.h"
 #include "src/index_schema.h"
 #include "src/indexes/tag.h"
@@ -30,6 +29,7 @@
 #include "src/metrics.h"
 #include "src/query/predicate.h"
 #include "src/query/search.h"
+#include "vmsdk/src/blocked_client.h"
 #include "vmsdk/src/log.h"
 #include "vmsdk/src/managed_pointers.h"
 #include "vmsdk/src/module_config.h"
@@ -81,8 +81,8 @@ vmsdk::config::Number &GetMaxSearchResultFieldsCount() {
 }
 
 /// Configuration for text query in-flight mutation wait timeout (milliseconds).
-/// This is the maximum time to wait for in-flight mutations to complete before
-/// proceeding with text query evaluation.
+/// This is the maximum time the client can be blocked waiting for in-flight
+/// mutations before timing out.
 constexpr absl::string_view kTextQueryInFlightWaitTimeoutMsConfig{
     "text-query-inflight-wait-timeout-ms"};
 constexpr int kDefaultTextQueryInFlightWaitTimeoutMs{5000};  // 5 seconds
@@ -101,105 +101,131 @@ static auto text_query_inflight_wait_timeout_ms =
                         kTextQueryInFlightWaitTimeoutMsConfig))
         .Build();
 
-/// Configuration for text query in-flight mutation poll interval (milliseconds)
-/// This is the interval between checks when waiting for in-flight mutations.
-constexpr absl::string_view kTextQueryInFlightPollIntervalMsConfig{
-    "text-query-inflight-poll-interval-ms"};
-constexpr int kDefaultTextQueryInFlightPollIntervalMs{10};  // 10ms
-constexpr int kMinTextQueryInFlightPollIntervalMs{1};
-constexpr int kMaxTextQueryInFlightPollIntervalMs{1000};
-
-static auto text_query_inflight_poll_interval_ms =
-    vmsdk::config::NumberBuilder(
-        kTextQueryInFlightPollIntervalMsConfig,
-        kDefaultTextQueryInFlightPollIntervalMs,
-        kMinTextQueryInFlightPollIntervalMs,
-        kMaxTextQueryInFlightPollIntervalMs)
-        .WithValidationCallback(
-            CHECK_RANGE(kMinTextQueryInFlightPollIntervalMs,
-                        kMaxTextQueryInFlightPollIntervalMs,
-                        kTextQueryInFlightPollIntervalMsConfig))
-        .Build();
-
 vmsdk::config::Number &GetTextQueryInFlightWaitTimeoutMs() {
   return dynamic_cast<vmsdk::config::Number &>(
       *text_query_inflight_wait_timeout_ms);
-}
-
-vmsdk::config::Number &GetTextQueryInFlightPollIntervalMs() {
-  return dynamic_cast<vmsdk::config::Number &>(
-      *text_query_inflight_poll_interval_ms);
 }
 
 }  // namespace valkey_search::options
 
 namespace valkey_search::query {
 
-InFlightWaitResult WaitForInFlightKeys(
-    ValkeyModuleCtx *ctx, const IndexSchema &index_schema,
-    const std::vector<InternedStringPtr> &keys) {
-  InFlightWaitResult result;
-  vmsdk::StopWatch stopwatch;
+// Forward declarations
+ProcessNeighborsStatus ProcessNeighborsForReplyImpl(
+    ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
+    std::deque<indexes::Neighbor> &neighbors,
+    const query::SearchParameters &parameters, const std::string &identifier,
+    std::function<void(ValkeyModuleCtx *, std::deque<indexes::Neighbor> &)>
+        send_response);
 
-  // Get initial in-flight keys
-  std::vector<InternedStringPtr> in_flight_keys =
-      index_schema.FilterInFlightKeys(keys);
-  result.initial_in_flight_count = in_flight_keys.size();
+// State stored as private data for the blocked client reply callback.
+// This contains all the information needed to continue processing after
+// the client is unblocked.
+struct InFlightWaitState {
+  std::deque<indexes::Neighbor> neighbors;
+  // We store a copy of relevant parameters rather than the full SearchParameters
+  // since we can't guarantee the lifetime of the original.
+  std::shared_ptr<IndexSchema> index_schema;
+  std::unique_ptr<AttributeDataType> attribute_data_type;
+  std::string identifier;
+  // The callback to invoke when processing completes.
+  std::function<void(ValkeyModuleCtx *, std::deque<indexes::Neighbor> &)>
+      send_response;
+  // Copy of filter parse results for re-evaluation
+  query::FilterParseResults filter_parse_results;
+  // Other search parameters needed for processing
+  std::vector<query::SearchParameters::ReturnAttribute> return_attributes;
+};
 
-  if (in_flight_keys.empty()) {
-    // No in-flight keys, return immediately
-    result.all_completed = true;
-    result.remaining_in_flight_count = 0;
-    result.wait_time_ms = 0;
-    return result;
+// Reply callback invoked when the blocked client is unblocked
+// (i.e., when the in-flight mutation completes).
+int InFlightReplyCallback(ValkeyModuleCtx *ctx,
+                          [[maybe_unused]] ValkeyModuleString **argv,
+                          [[maybe_unused]] int argc) {
+  auto *state = static_cast<InFlightWaitState *>(
+      ValkeyModule_GetBlockedClientPrivateData(ctx));
+  CHECK(state != nullptr);
+
+  // Reconstruct SearchParameters from the stored state
+  query::SearchParameters parameters;
+  parameters.index_schema = state->index_schema;
+  parameters.filter_parse_results = std::move(state->filter_parse_results);
+  parameters.return_attributes = std::move(state->return_attributes);
+
+  // Re-invoke ProcessNeighborsForReply to check for remaining conflicts
+  // and complete processing.
+  ProcessNeighborsStatus status = ProcessNeighborsForReplyImpl(
+      ctx, *state->attribute_data_type, state->neighbors, parameters,
+      state->identifier, std::move(state->send_response));
+
+  // If still blocked, the callback will be invoked again later.
+  // If complete, the send_response callback has already been called.
+  if (status == ProcessNeighborsStatus::kComplete) {
+    // Processing completed, state will be freed by InFlightFreeCallback
   }
 
-  const int64_t timeout_ms =
-      options::GetTextQueryInFlightWaitTimeoutMs().GetValue();
-  const int64_t poll_interval_ms =
-      options::GetTextQueryInFlightPollIntervalMs().GetValue();
+  return VALKEYMODULE_OK;
+}
 
-  VMSDK_LOG(DEBUG, ctx) << "Text query waiting for " << in_flight_keys.size()
-                        << " in-flight keys to complete (timeout: "
-                        << timeout_ms << "ms)";
+// Timeout callback for blocked client waiting for in-flight mutations.
+int InFlightTimeoutCallback(ValkeyModuleCtx *ctx,
+                            [[maybe_unused]] ValkeyModuleString **argv,
+                            [[maybe_unused]] int argc) {
+  ++Metrics::GetStats().text_query_inflight_timeout_cnt;
 
-  // Poll until all in-flight keys are processed or timeout
-  while (!in_flight_keys.empty()) {
-    int64_t elapsed_ms =
-        absl::ToInt64Milliseconds(stopwatch.Duration());
-    if (elapsed_ms >= timeout_ms) {
-      // Timeout reached
-      result.all_completed = false;
-      result.remaining_in_flight_count = in_flight_keys.size();
-      result.wait_time_ms = elapsed_ms;
+  auto *state = static_cast<InFlightWaitState *>(
+      ValkeyModule_GetBlockedClientPrivateData(ctx));
+  CHECK(state != nullptr);
 
-      VMSDK_LOG(WARNING, ctx)
-          << "Text query timed out waiting for in-flight keys. "
-          << "Initial: " << result.initial_in_flight_count
-          << ", Remaining: " << result.remaining_in_flight_count
-          << ", Wait time: " << elapsed_ms << "ms";
+  VMSDK_LOG(WARNING, ctx)
+      << "Text query timed out waiting for in-flight mutations";
 
-      ++Metrics::GetStats().text_query_inflight_timeout_cnt;
-      return result;
+  // On timeout, we filter out in-flight keys and respond with partial results
+  if (state->index_schema) {
+    std::vector<InternedStringPtr> neighbor_keys;
+    neighbor_keys.reserve(state->neighbors.size());
+    for (const auto &neighbor : state->neighbors) {
+      if (!neighbor.attribute_contents.has_value()) {
+        neighbor_keys.push_back(neighbor.external_id);
+      }
     }
 
-    // Sleep for poll interval
-    absl::SleepFor(absl::Milliseconds(poll_interval_ms));
+    std::vector<InternedStringPtr> still_in_flight =
+        state->index_schema->FilterInFlightKeys(neighbor_keys);
 
-    // Check which keys are still in-flight
-    in_flight_keys = index_schema.FilterInFlightKeys(in_flight_keys);
+    if (!still_in_flight.empty()) {
+      absl::flat_hash_set<const InternedString *> in_flight_set;
+      for (const auto &key : still_in_flight) {
+        in_flight_set.insert(key.get());
+      }
+
+      // Remove neighbors that are still in-flight
+      state->neighbors.erase(
+          std::remove_if(
+              state->neighbors.begin(), state->neighbors.end(),
+              [&in_flight_set](const indexes::Neighbor &neighbor) {
+                return in_flight_set.contains(neighbor.external_id.get());
+              }),
+          state->neighbors.end());
+
+      VMSDK_LOG(DEBUG, ctx) << "Filtered out " << still_in_flight.size()
+                            << " in-flight keys from text query results";
+    }
   }
 
-  result.all_completed = true;
-  result.remaining_in_flight_count = 0;
-  result.wait_time_ms = absl::ToInt64Milliseconds(stopwatch.Duration());
+  // Send partial response
+  if (state->send_response) {
+    state->send_response(ctx, state->neighbors);
+  }
 
-  VMSDK_LOG(DEBUG, ctx) << "Text query finished waiting for in-flight keys. "
-                        << "Initial: " << result.initial_in_flight_count
-                        << ", Wait time: " << result.wait_time_ms << "ms";
+  return VALKEYMODULE_OK;
+}
 
-  ++Metrics::GetStats().text_query_inflight_wait_success_cnt;
-  return result;
+// Free callback for cleaning up InFlightWaitState.
+void InFlightFreeCallback([[maybe_unused]] ValkeyModuleCtx *ctx,
+                          void *privdata) {
+  auto *state = static_cast<InFlightWaitState *>(privdata);
+  delete state;
 }
 
 class PredicateEvaluator : public query::Evaluator {
@@ -379,19 +405,18 @@ absl::StatusOr<RecordsMap> GetContent(
   return return_content;
 }
 
-// Adds all local content for neighbors to the list of neighbors.
-// This function is meant to be used for non-vector queries.
-void ProcessNonVectorNeighborsForReply(
-    ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
-    std::deque<indexes::Neighbor> &neighbors,
-    const query::SearchParameters &parameters) {
-  ProcessNeighborsForReply(ctx, attribute_data_type, neighbors, parameters, "");
-}
-
 // Helper to check if blocking for in-flight mutations is required.
-// Returns true for non-vector queries that contain text predicates.
+// Returns true for non-vector queries that contain text predicates and
+// when the client supports blocking (i.e., is a real user client, not a
+// thread-safe context).
 bool ShouldBlockForInFlightMutations(
-    const query::SearchParameters &parameters) {
+    ValkeyModuleCtx *ctx, const query::SearchParameters &parameters) {
+  // Only block for real user clients (not thread-safe contexts used by gRPC)
+  // Thread-safe contexts don't support ValkeyModule_BlockClient properly.
+  if (!vmsdk::IsRealUserClient(ctx)) {
+    return false;
+  }
+
   // Only block for non-vector queries (pure text or text+tag/numeric)
   if (!parameters.IsNonVectorQuery()) {
     return false;
@@ -403,19 +428,16 @@ bool ShouldBlockForInFlightMutations(
              parameters.filter_parse_results.root_predicate.get());
 }
 
-// Adds all local content for neighbors to the list of neighbors.
-//
-// Any neighbors already contained in the attribute content map will be skipped.
-// Any data not found locally will be skipped.
-void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
-                              const AttributeDataType &attribute_data_type,
-                              std::deque<indexes::Neighbor> &neighbors,
-                              const query::SearchParameters &parameters,
-                              const std::string &identifier) {
-  // For text queries, wait for any in-flight mutations to complete before
-  // processing. This ensures the text index is up-to-date for accurate filter
-  // evaluation.
-  if (ShouldBlockForInFlightMutations(parameters) && parameters.index_schema) {
+// Core implementation of ProcessNeighborsForReply that handles in-flight
+// blocking.
+ProcessNeighborsStatus ProcessNeighborsForReplyImpl(
+    ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
+    std::deque<indexes::Neighbor> &neighbors,
+    const query::SearchParameters &parameters, const std::string &identifier,
+    std::function<void(ValkeyModuleCtx *, std::deque<indexes::Neighbor> &)>
+        send_response) {
+  // For text queries, check for in-flight mutations before processing.
+  if (ShouldBlockForInFlightMutations(ctx, parameters) && parameters.index_schema) {
     // Extract all neighbor keys that need to be checked
     std::vector<InternedStringPtr> neighbor_keys;
     neighbor_keys.reserve(neighbors.size());
@@ -427,36 +449,62 @@ void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
     }
 
     if (!neighbor_keys.empty()) {
-      // Wait for in-flight mutations to complete
-      InFlightWaitResult wait_result =
-          WaitForInFlightKeys(ctx, *parameters.index_schema, neighbor_keys);
+      // Check which keys are in-flight
+      std::vector<InternedStringPtr> in_flight_keys =
+          parameters.index_schema->FilterInFlightKeys(neighbor_keys);
 
-      // If we timed out, filter out the keys that are still in-flight
-      // to avoid returning stale or inconsistent results
-      if (!wait_result.all_completed) {
-        std::vector<InternedStringPtr> still_in_flight =
-            parameters.index_schema->FilterInFlightKeys(neighbor_keys);
-        absl::flat_hash_set<const InternedString *> in_flight_set;
-        for (const auto &key : still_in_flight) {
-          in_flight_set.insert(key.get());
+      if (!in_flight_keys.empty()) {
+        VMSDK_LOG(DEBUG, ctx)
+            << "Text query blocking for " << in_flight_keys.size()
+            << " in-flight keys";
+
+        // Create state for the blocked client callback
+        auto *state = new InFlightWaitState();
+        state->neighbors = std::move(neighbors);
+        state->index_schema = parameters.index_schema;
+        state->attribute_data_type = attribute_data_type.Clone();
+        state->identifier = identifier;
+        state->send_response = std::move(send_response);
+        state->filter_parse_results = parameters.filter_parse_results;
+        state->return_attributes = parameters.return_attributes;
+
+        // Create blocked client with callback
+        int64_t timeout_ms =
+            options::GetTextQueryInFlightWaitTimeoutMs().GetValue();
+        vmsdk::BlockedClient blocked_client(
+            ctx, InFlightReplyCallback, InFlightTimeoutCallback,
+            InFlightFreeCallback, timeout_ms);
+        blocked_client.SetReplyPrivateData(state);
+        blocked_client.MeasureTimeStart();
+
+        // Attach to the first in-flight key's DocumentMutation.
+        // When that mutation completes, our client will be unblocked.
+        // The callback will re-check all keys in case there are still conflicts.
+        bool attached = parameters.index_schema->AttachBlockedClientToInFlightKey(
+            in_flight_keys[0], std::move(blocked_client));
+
+        if (attached) {
+          ++Metrics::GetStats().text_query_inflight_wait_success_cnt;
+          return ProcessNeighborsStatus::kBlocked;
         }
 
-        // Remove neighbors that are still in-flight
-        neighbors.erase(
-            std::remove_if(
-                neighbors.begin(), neighbors.end(),
-                [&in_flight_set](const indexes::Neighbor &neighbor) {
-                  return in_flight_set.contains(neighbor.external_id.get());
-                }),
-            neighbors.end());
+        // If attach failed (key completed between check and attach), fall
+        // through and process normally. The state will be cleaned up when
+        // blocked_client goes out of scope and unblocks, which will trigger
+        // InFlightFreeCallback.
+        VMSDK_LOG(DEBUG, ctx) << "In-flight key completed during attach, "
+                                 "proceeding with processing";
 
-        VMSDK_LOG(DEBUG, ctx)
-            << "Filtered out " << still_in_flight.size()
-            << " in-flight keys from text query results after timeout";
+        // Recover the state since we're not blocking
+        neighbors = std::move(state->neighbors);
+        send_response = std::move(state->send_response);
+        // Note: state will be freed by InFlightFreeCallback when blocked_client
+        // is destroyed
       }
     }
   }
 
+  // No in-flight conflicts (or not a text query), process normally
   const auto max_content_size =
       options::GetMaxSearchResultRecordSize().GetValue();
   const auto max_content_fields =
@@ -474,7 +522,6 @@ void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
     }
 
     // Check content size before assigning
-
     size_t total_size = 0;
     bool size_exceeded = false;
     if (content.value().size() > max_content_fields) {
@@ -504,14 +551,42 @@ void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
       neighbor.attribute_contents = std::move(content.value());
     }
   }
+
   // Remove all entries that don't have content now.
-  // TODO: incorporate a retry in case of removal.
   neighbors.erase(
       std::remove_if(neighbors.begin(), neighbors.end(),
                      [](const indexes::Neighbor &neighbor) {
                        return !neighbor.attribute_contents.has_value();
                      }),
       neighbors.end());
+
+  // Call the send_response callback to serialize and send the response
+  if (send_response) {
+    send_response(ctx, neighbors);
+  }
+
+  return ProcessNeighborsStatus::kComplete;
+}
+
+ProcessNeighborsStatus ProcessNeighborsForReply(
+    ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
+    std::deque<indexes::Neighbor> &neighbors,
+    const query::SearchParameters &parameters, const std::string &identifier,
+    std::function<void(ValkeyModuleCtx *, std::deque<indexes::Neighbor> &)>
+        send_response) {
+  return ProcessNeighborsForReplyImpl(ctx, attribute_data_type, neighbors,
+                                      parameters, identifier,
+                                      std::move(send_response));
+}
+
+ProcessNeighborsStatus ProcessNonVectorNeighborsForReply(
+    ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
+    std::deque<indexes::Neighbor> &neighbors,
+    const query::SearchParameters &parameters,
+    std::function<void(ValkeyModuleCtx *, std::deque<indexes::Neighbor> &)>
+        send_response) {
+  return ProcessNeighborsForReply(ctx, attribute_data_type, neighbors,
+                                  parameters, "", std::move(send_response));
 }
 
 }  // namespace valkey_search::query

@@ -1237,6 +1237,21 @@ std::vector<InternedStringPtr> IndexSchema::FilterInFlightKeys(
   return in_flight_keys;
 }
 
+bool IndexSchema::AttachBlockedClientToInFlightKey(
+    const InternedStringPtr &key, vmsdk::BlockedClient blocked_client) {
+  absl::MutexLock lock(&mutated_records_mutex_);
+  auto itr = tracked_mutated_records_.find(key);
+  if (itr == tracked_mutated_records_.end()) {
+    // Key is no longer in-flight (mutation completed between check and attach)
+    return false;
+  }
+  // Attach the blocked client to this mutation. When the mutation completes
+  // and DocumentMutation is destroyed, the BlockedClient destructor will
+  // call UnblockClient, triggering the reply callback.
+  itr->second.blocked_clients.emplace_back(std::move(blocked_client));
+  return true;
+}
+
 bool IndexSchema::InTrackedMutationRecords(
     const InternedStringPtr &key, const std::string &identifier) const {
   absl::MutexLock lock(&mutated_records_mutex_);

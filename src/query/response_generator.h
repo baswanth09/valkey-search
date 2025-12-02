@@ -9,6 +9,8 @@
 #define VALKEYSEARCH_SRC_QUERY_RESPONSE_GENERATOR_H_
 
 #include <deque>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -33,53 +35,47 @@ vmsdk::config::Number &GetMaxSearchResultFieldsCount();
 
 /// Return the configuration entry that allows the caller to control the
 /// maximum wait time (in milliseconds) for in-flight mutations to complete
-/// before processing text query results.
+/// before blocking the client.
 vmsdk::config::Number &GetTextQueryInFlightWaitTimeoutMs();
-
-/// Return the configuration entry that allows the caller to control the
-/// poll interval (in milliseconds) when waiting for in-flight mutations.
-vmsdk::config::Number &GetTextQueryInFlightPollIntervalMs();
 
 }  // namespace valkey_search::options
 namespace valkey_search::query {
 
-// Result of waiting for in-flight keys to complete.
-struct InFlightWaitResult {
-  // True if all in-flight keys completed before timeout.
-  bool all_completed{true};
-  // Number of keys that were in-flight at the start of waiting.
-  size_t initial_in_flight_count{0};
-  // Number of keys still in-flight after waiting (if timed out).
-  size_t remaining_in_flight_count{0};
-  // Total time spent waiting.
-  int64_t wait_time_ms{0};
+// Result status from ProcessNeighborsForReply functions.
+enum class ProcessNeighborsStatus {
+  // Processing completed successfully. Caller should send response.
+  kComplete,
+  // Client was blocked waiting for in-flight mutations. Caller should NOT
+  // send response - the blocked client callback will handle it.
+  kBlocked,
 };
-
-// Waits for in-flight mutations to complete for the specified keys.
-// This is used by text queries to ensure that the text index is up-to-date
-// before evaluating predicates.
-//
-// Returns InFlightWaitResult indicating whether all keys completed or timed
-// out.
-InFlightWaitResult WaitForInFlightKeys(
-    ValkeyModuleCtx *ctx, const IndexSchema &index_schema,
-    const std::vector<InternedStringPtr> &keys);
 
 // Adds all local content for neighbors to the list of neighbors.
 // Skipping neighbors if one of the following:
 // Neighbor already contained in the attribute content map.
 // Neighbor without any attribute content.
 // Neighbor not comply to the pre-filter expression.
-void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
-                              const AttributeDataType &attribute_data_type,
-                              std::deque<indexes::Neighbor> &neighbors,
-                              const query::SearchParameters &parameters,
-                              const std::string &identifier);
-
-void ProcessNonVectorNeighborsForReply(
+//
+// For text queries with in-flight mutations, this may block the client
+// and return kBlocked. In that case, the caller should NOT send a response -
+// the blocked client callback will handle response generation when the
+// mutations complete.
+//
+// The send_response callback is called when processing completes (either
+// immediately or after blocking). It should serialize and send the response.
+ProcessNeighborsStatus ProcessNeighborsForReply(
     ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
     std::deque<indexes::Neighbor> &neighbors,
-    const query::SearchParameters &parameters);
+    const query::SearchParameters &parameters, const std::string &identifier,
+    std::function<void(ValkeyModuleCtx *, std::deque<indexes::Neighbor> &)>
+        send_response);
+
+ProcessNeighborsStatus ProcessNonVectorNeighborsForReply(
+    ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
+    std::deque<indexes::Neighbor> &neighbors,
+    const query::SearchParameters &parameters,
+    std::function<void(ValkeyModuleCtx *, std::deque<indexes::Neighbor> &)>
+        send_response);
 
 }  // namespace valkey_search::query
 

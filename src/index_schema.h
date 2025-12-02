@@ -302,6 +302,16 @@ class IndexSchema : public KeyspaceEventSubscription,
   std::vector<InternedStringPtr> FilterInFlightKeys(
       const std::vector<InternedStringPtr> &keys) const
       ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
+
+  // Attaches a BlockedClient to an in-flight key's DocumentMutation.
+  // When the mutation completes, the BlockedClient will be destroyed,
+  // which triggers UnblockClient and invokes the reply callback.
+  // Returns true if the key was in-flight and the client was attached.
+  // Returns false if the key is no longer in-flight (mutation completed).
+  bool AttachBlockedClientToInFlightKey(const InternedStringPtr &key,
+                                        vmsdk::BlockedClient blocked_client)
+      ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
+
   std::optional<MutatedAttributes> ConsumeTrackedMutatedAttribute(
       const InternedStringPtr &key, bool first_time)
       ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);

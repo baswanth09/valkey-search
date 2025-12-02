@@ -145,8 +145,11 @@ TEST_P(ResponseGeneratorTest, ProcessNeighborsForReply) {
           return std::move(returned_records_map);
         });
   }
+  // The new API requires a send_response callback. For testing, we use an empty
+  // callback since we're only testing the neighbor processing logic.
+  auto send_response = [](ValkeyModuleCtx *, std::deque<indexes::Neighbor> &) {};
   ProcessNeighborsForReply(&fake_ctx, data_type, expected_neighbors, parameters,
-                           parameters.attribute_alias);
+                           parameters.attribute_alias, send_response);
   EXPECT_EQ(expected_neighbors.size(), params.expected_neighbors.size());
   for (size_t i = 0; i < params.expected_neighbors.size(); ++i) {
     EXPECT_EQ(std::string(*expected_neighbors[i].external_id),
@@ -260,8 +263,11 @@ TEST_F(ResponseGeneratorTest, ProcessNeighborsForReplyContentLimits) {
         return many_fields_content;
       });
 
+  // The new API requires a send_response callback. For testing, we use an empty
+  // callback since we're only testing the content limit logic.
+  auto send_response = [](ValkeyModuleCtx *, std::deque<indexes::Neighbor> &) {};
   ProcessNeighborsForReply(&fake_ctx, data_type, neighbors, parameters,
-                           parameters.attribute_alias);
+                           parameters.attribute_alias, send_response);
 
   // Verify that only the neighbor with small content remains
   // (both large content and many fields neighbors should be filtered out)
@@ -676,46 +682,13 @@ TEST_F(ContainsTextPredicateTest, NegatedNonTextPredicateReturnsFalse) {
   EXPECT_FALSE(query::ContainsTextPredicate(negated.get()));
 }
 
-// Tests for InFlightWaitResult and WaitForInFlightKeys
-class WaitForInFlightKeysTest : public ValkeySearchTest {};
+// Test configuration getters for in-flight blocking
+class InFlightBlockingConfigTest : public ValkeySearchTest {};
 
-TEST_F(WaitForInFlightKeysTest, NoInFlightKeysReturnsImmediately) {
-  auto index_schema = CreateIndexSchema("test_schema").value();
-  std::vector<InternedStringPtr> keys;
-  keys.push_back(StringInternStore::Intern("key1"));
-  keys.push_back(StringInternStore::Intern("key2"));
-
-  ValkeyModuleCtx fake_ctx;
-  auto result = query::WaitForInFlightKeys(&fake_ctx, *index_schema, keys);
-
-  EXPECT_TRUE(result.all_completed);
-  EXPECT_EQ(result.initial_in_flight_count, 0);
-  EXPECT_EQ(result.remaining_in_flight_count, 0);
-  EXPECT_EQ(result.wait_time_ms, 0);
-}
-
-TEST_F(WaitForInFlightKeysTest, EmptyKeysReturnsImmediately) {
-  auto index_schema = CreateIndexSchema("test_schema").value();
-  std::vector<InternedStringPtr> keys;
-
-  ValkeyModuleCtx fake_ctx;
-  auto result = query::WaitForInFlightKeys(&fake_ctx, *index_schema, keys);
-
-  EXPECT_TRUE(result.all_completed);
-  EXPECT_EQ(result.initial_in_flight_count, 0);
-  EXPECT_EQ(result.remaining_in_flight_count, 0);
-  EXPECT_EQ(result.wait_time_ms, 0);
-}
-
-// Test configuration getters
-TEST_F(WaitForInFlightKeysTest, ConfigurationDefaults) {
-  // Verify that the configuration options have sensible defaults
+TEST_F(InFlightBlockingConfigTest, TimeoutConfigurationDefaults) {
+  // Verify that the timeout configuration has sensible defaults
   auto timeout_ms = query::options::GetTextQueryInFlightWaitTimeoutMs().GetValue();
-  auto poll_interval_ms = query::options::GetTextQueryInFlightPollIntervalMs().GetValue();
-
   EXPECT_GT(timeout_ms, 0);
-  EXPECT_GT(poll_interval_ms, 0);
-  EXPECT_LT(poll_interval_ms, timeout_ms);
 }
 
 }  // namespace
