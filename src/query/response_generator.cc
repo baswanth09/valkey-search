@@ -143,7 +143,7 @@ InFlightWaitResult WaitForInFlightKeys(
 
   // Get initial in-flight keys
   std::vector<InternedStringPtr> in_flight_keys =
-      index_schema.GetInFlightKeys(keys);
+      index_schema.FilterInFlightKeys(keys);
   result.initial_in_flight_count = in_flight_keys.size();
 
   if (in_flight_keys.empty()) {
@@ -187,7 +187,7 @@ InFlightWaitResult WaitForInFlightKeys(
     absl::SleepFor(absl::Milliseconds(poll_interval_ms));
 
     // Check which keys are still in-flight
-    in_flight_keys = index_schema.GetInFlightKeys(in_flight_keys);
+    in_flight_keys = index_schema.FilterInFlightKeys(in_flight_keys);
   }
 
   result.all_completed = true;
@@ -435,7 +435,7 @@ void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
       // to avoid returning stale or inconsistent results
       if (!wait_result.all_completed) {
         std::vector<InternedStringPtr> still_in_flight =
-            parameters.index_schema->GetInFlightKeys(neighbor_keys);
+            parameters.index_schema->FilterInFlightKeys(neighbor_keys);
         absl::flat_hash_set<const InternedString *> in_flight_set;
         for (const auto &key : still_in_flight) {
           in_flight_set.insert(key.get());

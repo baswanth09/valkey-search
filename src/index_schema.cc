@@ -1225,7 +1225,7 @@ bool IndexSchema::IsKeyInFlight(const InternedStringPtr &key) const {
   return tracked_mutated_records_.contains(key);
 }
 
-std::vector<InternedStringPtr> IndexSchema::GetInFlightKeys(
+std::vector<InternedStringPtr> IndexSchema::FilterInFlightKeys(
     const std::vector<InternedStringPtr> &keys) const {
   absl::MutexLock lock(&mutated_records_mutex_);
   std::vector<InternedStringPtr> in_flight_keys;
