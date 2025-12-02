@@ -11,24 +11,31 @@
 #include <deque>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "src/attribute_data_type.h"
+#include "src/index_schema.h"
 #include "src/indexes/tag.h"
 #include "src/indexes/text.h"
 #include "src/indexes/vector_base.h"
 #include "src/metrics.h"
 #include "src/query/predicate.h"
 #include "src/query/search.h"
+#include "vmsdk/src/log.h"
 #include "vmsdk/src/managed_pointers.h"
 #include "vmsdk/src/module_config.h"
 #include "vmsdk/src/status/status_macros.h"
 #include "vmsdk/src/type_conversions.h"
+#include "vmsdk/src/utils.h"
 #include "vmsdk/src/valkey_module_api/valkey_module.h"
 
 namespace valkey_search::options {
@@ -73,9 +80,127 @@ vmsdk::config::Number &GetMaxSearchResultFieldsCount() {
   return dynamic_cast<vmsdk::config::Number &>(*max_search_result_fields_count);
 }
 
+/// Configuration for text query in-flight mutation wait timeout (milliseconds).
+/// This is the maximum time to wait for in-flight mutations to complete before
+/// proceeding with text query evaluation.
+constexpr absl::string_view kTextQueryInFlightWaitTimeoutMsConfig{
+    "text-query-inflight-wait-timeout-ms"};
+constexpr int kDefaultTextQueryInFlightWaitTimeoutMs{5000};  // 5 seconds
+constexpr int kMinTextQueryInFlightWaitTimeoutMs{0};
+constexpr int kMaxTextQueryInFlightWaitTimeoutMs{60000};  // 60 seconds
+
+static auto text_query_inflight_wait_timeout_ms =
+    vmsdk::config::NumberBuilder(
+        kTextQueryInFlightWaitTimeoutMsConfig,
+        kDefaultTextQueryInFlightWaitTimeoutMs,
+        kMinTextQueryInFlightWaitTimeoutMs,
+        kMaxTextQueryInFlightWaitTimeoutMs)
+        .WithValidationCallback(
+            CHECK_RANGE(kMinTextQueryInFlightWaitTimeoutMs,
+                        kMaxTextQueryInFlightWaitTimeoutMs,
+                        kTextQueryInFlightWaitTimeoutMsConfig))
+        .Build();
+
+/// Configuration for text query in-flight mutation poll interval (milliseconds)
+/// This is the interval between checks when waiting for in-flight mutations.
+constexpr absl::string_view kTextQueryInFlightPollIntervalMsConfig{
+    "text-query-inflight-poll-interval-ms"};
+constexpr int kDefaultTextQueryInFlightPollIntervalMs{10};  // 10ms
+constexpr int kMinTextQueryInFlightPollIntervalMs{1};
+constexpr int kMaxTextQueryInFlightPollIntervalMs{1000};
+
+static auto text_query_inflight_poll_interval_ms =
+    vmsdk::config::NumberBuilder(
+        kTextQueryInFlightPollIntervalMsConfig,
+        kDefaultTextQueryInFlightPollIntervalMs,
+        kMinTextQueryInFlightPollIntervalMs,
+        kMaxTextQueryInFlightPollIntervalMs)
+        .WithValidationCallback(
+            CHECK_RANGE(kMinTextQueryInFlightPollIntervalMs,
+                        kMaxTextQueryInFlightPollIntervalMs,
+                        kTextQueryInFlightPollIntervalMsConfig))
+        .Build();
+
+vmsdk::config::Number &GetTextQueryInFlightWaitTimeoutMs() {
+  return dynamic_cast<vmsdk::config::Number &>(
+      *text_query_inflight_wait_timeout_ms);
+}
+
+vmsdk::config::Number &GetTextQueryInFlightPollIntervalMs() {
+  return dynamic_cast<vmsdk::config::Number &>(
+      *text_query_inflight_poll_interval_ms);
+}
+
 }  // namespace valkey_search::options
 
 namespace valkey_search::query {
+
+InFlightWaitResult WaitForInFlightKeys(
+    ValkeyModuleCtx *ctx, const IndexSchema &index_schema,
+    const std::vector<InternedStringPtr> &keys) {
+  InFlightWaitResult result;
+  vmsdk::StopWatch stopwatch;
+
+  // Get initial in-flight keys
+  std::vector<InternedStringPtr> in_flight_keys =
+      index_schema.GetInFlightKeys(keys);
+  result.initial_in_flight_count = in_flight_keys.size();
+
+  if (in_flight_keys.empty()) {
+    // No in-flight keys, return immediately
+    result.all_completed = true;
+    result.remaining_in_flight_count = 0;
+    result.wait_time_ms = 0;
+    return result;
+  }
+
+  const int64_t timeout_ms =
+      options::GetTextQueryInFlightWaitTimeoutMs().GetValue();
+  const int64_t poll_interval_ms =
+      options::GetTextQueryInFlightPollIntervalMs().GetValue();
+
+  VMSDK_LOG(DEBUG, ctx) << "Text query waiting for " << in_flight_keys.size()
+                        << " in-flight keys to complete (timeout: "
+                        << timeout_ms << "ms)";
+
+  // Poll until all in-flight keys are processed or timeout
+  while (!in_flight_keys.empty()) {
+    int64_t elapsed_ms =
+        absl::ToInt64Milliseconds(stopwatch.Duration());
+    if (elapsed_ms >= timeout_ms) {
+      // Timeout reached
+      result.all_completed = false;
+      result.remaining_in_flight_count = in_flight_keys.size();
+      result.wait_time_ms = elapsed_ms;
+
+      VMSDK_LOG(WARNING, ctx)
+          << "Text query timed out waiting for in-flight keys. "
+          << "Initial: " << result.initial_in_flight_count
+          << ", Remaining: " << result.remaining_in_flight_count
+          << ", Wait time: " << elapsed_ms << "ms";
+
+      ++Metrics::GetStats().text_query_inflight_timeout_cnt;
+      return result;
+    }
+
+    // Sleep for poll interval
+    absl::SleepFor(absl::Milliseconds(poll_interval_ms));
+
+    // Check which keys are still in-flight
+    in_flight_keys = index_schema.GetInFlightKeys(in_flight_keys);
+  }
+
+  result.all_completed = true;
+  result.remaining_in_flight_count = 0;
+  result.wait_time_ms = absl::ToInt64Milliseconds(stopwatch.Duration());
+
+  VMSDK_LOG(DEBUG, ctx) << "Text query finished waiting for in-flight keys. "
+                        << "Initial: " << result.initial_in_flight_count
+                        << ", Wait time: " << result.wait_time_ms << "ms";
+
+  ++Metrics::GetStats().text_query_inflight_wait_success_cnt;
+  return result;
+}
 
 class PredicateEvaluator : public query::Evaluator {
  public:
@@ -150,10 +275,10 @@ bool VerifyFilter(const query::Predicate *predicate, const RecordsMap &records,
     return true;
   }
   // For text predicates, evaluate using the text index instead of raw data.
+  // Note: In-flight key waiting is now handled in ProcessNeighborsForReply
+  // before this function is called, ensuring the text index is up-to-date.
   if (parameters.index_schema &&
       parameters.index_schema->GetTextIndexSchema()) {
-    // TODO: Wait for any in-flight indexing operations to complete before
-    // acquiring the lock, ensuring we evaluate against the latest index state.
     return parameters.index_schema->GetTextIndexSchema()->WithPerKeyTextIndexes(
         [&](auto &per_key_indexes) {
           PredicateEvaluator evaluator(records, &per_key_indexes, target_key);
@@ -263,6 +388,21 @@ void ProcessNonVectorNeighborsForReply(
   ProcessNeighborsForReply(ctx, attribute_data_type, neighbors, parameters, "");
 }
 
+// Helper to check if blocking for in-flight mutations is required.
+// Returns true for non-vector queries that contain text predicates.
+bool ShouldBlockForInFlightMutations(
+    const query::SearchParameters &parameters) {
+  // Only block for non-vector queries (pure text or text+tag/numeric)
+  if (!parameters.IsNonVectorQuery()) {
+    return false;
+  }
+
+  // Only block if the query has text predicates
+  return parameters.filter_parse_results.root_predicate != nullptr &&
+         ContainsTextPredicate(
+             parameters.filter_parse_results.root_predicate.get());
+}
+
 // Adds all local content for neighbors to the list of neighbors.
 //
 // Any neighbors already contained in the attribute content map will be skipped.
@@ -272,6 +412,51 @@ void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
                               std::deque<indexes::Neighbor> &neighbors,
                               const query::SearchParameters &parameters,
                               const std::string &identifier) {
+  // For text queries, wait for any in-flight mutations to complete before
+  // processing. This ensures the text index is up-to-date for accurate filter
+  // evaluation.
+  if (ShouldBlockForInFlightMutations(parameters) && parameters.index_schema) {
+    // Extract all neighbor keys that need to be checked
+    std::vector<InternedStringPtr> neighbor_keys;
+    neighbor_keys.reserve(neighbors.size());
+    for (const auto &neighbor : neighbors) {
+      // Only check keys that don't already have content (local keys)
+      if (!neighbor.attribute_contents.has_value()) {
+        neighbor_keys.push_back(neighbor.external_id);
+      }
+    }
+
+    if (!neighbor_keys.empty()) {
+      // Wait for in-flight mutations to complete
+      InFlightWaitResult wait_result =
+          WaitForInFlightKeys(ctx, *parameters.index_schema, neighbor_keys);
+
+      // If we timed out, filter out the keys that are still in-flight
+      // to avoid returning stale or inconsistent results
+      if (!wait_result.all_completed) {
+        std::vector<InternedStringPtr> still_in_flight =
+            parameters.index_schema->GetInFlightKeys(neighbor_keys);
+        absl::flat_hash_set<const InternedString *> in_flight_set;
+        for (const auto &key : still_in_flight) {
+          in_flight_set.insert(key.get());
+        }
+
+        // Remove neighbors that are still in-flight
+        neighbors.erase(
+            std::remove_if(
+                neighbors.begin(), neighbors.end(),
+                [&in_flight_set](const indexes::Neighbor &neighbor) {
+                  return in_flight_set.contains(neighbor.external_id.get());
+                }),
+            neighbors.end());
+
+        VMSDK_LOG(DEBUG, ctx)
+            << "Filtered out " << still_in_flight.size()
+            << " in-flight keys from text query results after timeout";
+      }
+    }
+  }
+
   const auto max_content_size =
       options::GetMaxSearchResultRecordSize().GetValue();
   const auto max_content_fields =

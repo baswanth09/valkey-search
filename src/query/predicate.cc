@@ -400,4 +400,34 @@ EvaluationResult ComposedPredicate::Evaluate(Evaluator& evaluator) const {
   return EvaluationResult(lhs.matches || rhs.matches);
 }
 
+bool ContainsTextPredicate(const Predicate* predicate) {
+  if (predicate == nullptr) {
+    return false;
+  }
+
+  switch (predicate->GetType()) {
+    case PredicateType::kText:
+      return true;
+
+    case PredicateType::kComposedAnd:
+    case PredicateType::kComposedOr: {
+      const auto* composed =
+          dynamic_cast<const ComposedPredicate*>(predicate);
+      return ContainsTextPredicate(composed->GetLhsPredicate()) ||
+             ContainsTextPredicate(composed->GetRhsPredicate());
+    }
+
+    case PredicateType::kNegate: {
+      const auto* negate = dynamic_cast<const NegatePredicate*>(predicate);
+      return ContainsTextPredicate(negate->GetPredicate());
+    }
+
+    case PredicateType::kTag:
+    case PredicateType::kNumeric:
+    case PredicateType::kNone:
+    default:
+      return false;
+  }
+}
+
 }  // namespace valkey_search::query

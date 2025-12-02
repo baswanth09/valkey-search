@@ -22,6 +22,10 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "src/attribute_data_type.h"
+#include "src/indexes/numeric.h"
+#include "src/indexes/tag.h"
+#include "src/indexes/text.h"
+#include "src/indexes/text/text_index.h"
 #include "src/indexes/vector_base.h"
 #include "src/metrics.h"
 #include "src/query/predicate.h"
@@ -542,6 +546,177 @@ INSTANTIATE_TEST_SUITE_P(
     [](const TestParamInfo<ResponseGeneratorTestCase> &info) {
       return info.param.test_name;
     });
+
+// Tests for ContainsTextPredicate function
+class ContainsTextPredicateTest : public ValkeySearchTest {};
+
+TEST_F(ContainsTextPredicateTest, NullPredicateReturnsFalse) {
+  EXPECT_FALSE(query::ContainsTextPredicate(nullptr));
+}
+
+TEST_F(ContainsTextPredicateTest, TagPredicateReturnsFalse) {
+  data_model::TagIndex tag_index_proto;
+  tag_index_proto.set_separator(",");
+  auto tag_index = std::make_shared<indexes::Tag>(tag_index_proto);
+
+  absl::flat_hash_set<absl::string_view> tags = {"tag1"};
+  auto predicate = std::make_unique<query::TagPredicate>(
+      tag_index.get(), "alias", "identifier", "tag1", tags);
+
+  EXPECT_FALSE(query::ContainsTextPredicate(predicate.get()));
+}
+
+TEST_F(ContainsTextPredicateTest, NumericPredicateReturnsFalse) {
+  data_model::NumericIndex numeric_index_proto;
+  auto numeric_index = std::make_shared<indexes::Numeric>(numeric_index_proto);
+
+  auto predicate = std::make_unique<query::NumericPredicate>(
+      numeric_index.get(), "alias", "identifier", 0.0, true, 100.0, true);
+
+  EXPECT_FALSE(query::ContainsTextPredicate(predicate.get()));
+}
+
+TEST_F(ContainsTextPredicateTest, TermPredicateReturnsTrue) {
+  auto text_index_schema = std::make_shared<indexes::text::TextIndexSchema>(
+      data_model::LANGUAGE_ENGLISH, ".", true, std::vector<std::string>{});
+
+  auto predicate = std::make_unique<query::TermPredicate>(
+      text_index_schema, 1ULL, "hello", false);
+
+  EXPECT_TRUE(query::ContainsTextPredicate(predicate.get()));
+}
+
+TEST_F(ContainsTextPredicateTest, PrefixPredicateReturnsTrue) {
+  auto text_index_schema = std::make_shared<indexes::text::TextIndexSchema>(
+      data_model::LANGUAGE_ENGLISH, ".", true, std::vector<std::string>{});
+
+  auto predicate = std::make_unique<query::PrefixPredicate>(
+      text_index_schema, 1ULL, "hel");
+
+  EXPECT_TRUE(query::ContainsTextPredicate(predicate.get()));
+}
+
+TEST_F(ContainsTextPredicateTest, ComposedAndWithTextReturnsTrue) {
+  auto text_index_schema = std::make_shared<indexes::text::TextIndexSchema>(
+      data_model::LANGUAGE_ENGLISH, ".", true, std::vector<std::string>{});
+
+  data_model::NumericIndex numeric_index_proto;
+  auto numeric_index = std::make_shared<indexes::Numeric>(numeric_index_proto);
+
+  auto text_pred = std::make_unique<query::TermPredicate>(
+      text_index_schema, 1ULL, "hello", false);
+  auto numeric_pred = std::make_unique<query::NumericPredicate>(
+      numeric_index.get(), "alias", "identifier", 0.0, true, 100.0, true);
+
+  auto composed = std::make_unique<query::ComposedPredicate>(
+      std::move(text_pred), std::move(numeric_pred), query::LogicalOperator::kAnd);
+
+  EXPECT_TRUE(query::ContainsTextPredicate(composed.get()));
+}
+
+TEST_F(ContainsTextPredicateTest, ComposedOrWithTextReturnsTrue) {
+  auto text_index_schema = std::make_shared<indexes::text::TextIndexSchema>(
+      data_model::LANGUAGE_ENGLISH, ".", true, std::vector<std::string>{});
+
+  data_model::TagIndex tag_index_proto;
+  tag_index_proto.set_separator(",");
+  auto tag_index = std::make_shared<indexes::Tag>(tag_index_proto);
+  absl::flat_hash_set<absl::string_view> tags = {"tag1"};
+
+  auto text_pred = std::make_unique<query::TermPredicate>(
+      text_index_schema, 1ULL, "hello", false);
+  auto tag_pred = std::make_unique<query::TagPredicate>(
+      tag_index.get(), "alias", "identifier", "tag1", tags);
+
+  auto composed = std::make_unique<query::ComposedPredicate>(
+      std::move(text_pred), std::move(tag_pred), query::LogicalOperator::kOr);
+
+  EXPECT_TRUE(query::ContainsTextPredicate(composed.get()));
+}
+
+TEST_F(ContainsTextPredicateTest, ComposedWithoutTextReturnsFalse) {
+  data_model::NumericIndex numeric_index_proto;
+  auto numeric_index = std::make_shared<indexes::Numeric>(numeric_index_proto);
+
+  data_model::TagIndex tag_index_proto;
+  tag_index_proto.set_separator(",");
+  auto tag_index = std::make_shared<indexes::Tag>(tag_index_proto);
+  absl::flat_hash_set<absl::string_view> tags = {"tag1"};
+
+  auto numeric_pred = std::make_unique<query::NumericPredicate>(
+      numeric_index.get(), "alias", "identifier", 0.0, true, 100.0, true);
+  auto tag_pred = std::make_unique<query::TagPredicate>(
+      tag_index.get(), "alias", "identifier", "tag1", tags);
+
+  auto composed = std::make_unique<query::ComposedPredicate>(
+      std::move(numeric_pred), std::move(tag_pred), query::LogicalOperator::kAnd);
+
+  EXPECT_FALSE(query::ContainsTextPredicate(composed.get()));
+}
+
+TEST_F(ContainsTextPredicateTest, NegatedTextPredicateReturnsTrue) {
+  auto text_index_schema = std::make_shared<indexes::text::TextIndexSchema>(
+      data_model::LANGUAGE_ENGLISH, ".", true, std::vector<std::string>{});
+
+  auto text_pred = std::make_unique<query::TermPredicate>(
+      text_index_schema, 1ULL, "hello", false);
+  auto negated = std::make_unique<query::NegatePredicate>(std::move(text_pred));
+
+  EXPECT_TRUE(query::ContainsTextPredicate(negated.get()));
+}
+
+TEST_F(ContainsTextPredicateTest, NegatedNonTextPredicateReturnsFalse) {
+  data_model::NumericIndex numeric_index_proto;
+  auto numeric_index = std::make_shared<indexes::Numeric>(numeric_index_proto);
+
+  auto numeric_pred = std::make_unique<query::NumericPredicate>(
+      numeric_index.get(), "alias", "identifier", 0.0, true, 100.0, true);
+  auto negated = std::make_unique<query::NegatePredicate>(std::move(numeric_pred));
+
+  EXPECT_FALSE(query::ContainsTextPredicate(negated.get()));
+}
+
+// Tests for InFlightWaitResult and WaitForInFlightKeys
+class WaitForInFlightKeysTest : public ValkeySearchTest {};
+
+TEST_F(WaitForInFlightKeysTest, NoInFlightKeysReturnsImmediately) {
+  auto index_schema = CreateIndexSchema("test_schema").value();
+  std::vector<InternedStringPtr> keys;
+  keys.push_back(StringInternStore::Intern("key1"));
+  keys.push_back(StringInternStore::Intern("key2"));
+
+  ValkeyModuleCtx fake_ctx;
+  auto result = query::WaitForInFlightKeys(&fake_ctx, *index_schema, keys);
+
+  EXPECT_TRUE(result.all_completed);
+  EXPECT_EQ(result.initial_in_flight_count, 0);
+  EXPECT_EQ(result.remaining_in_flight_count, 0);
+  EXPECT_EQ(result.wait_time_ms, 0);
+}
+
+TEST_F(WaitForInFlightKeysTest, EmptyKeysReturnsImmediately) {
+  auto index_schema = CreateIndexSchema("test_schema").value();
+  std::vector<InternedStringPtr> keys;
+
+  ValkeyModuleCtx fake_ctx;
+  auto result = query::WaitForInFlightKeys(&fake_ctx, *index_schema, keys);
+
+  EXPECT_TRUE(result.all_completed);
+  EXPECT_EQ(result.initial_in_flight_count, 0);
+  EXPECT_EQ(result.remaining_in_flight_count, 0);
+  EXPECT_EQ(result.wait_time_ms, 0);
+}
+
+// Test configuration getters
+TEST_F(WaitForInFlightKeysTest, ConfigurationDefaults) {
+  // Verify that the configuration options have sensible defaults
+  auto timeout_ms = query::options::GetTextQueryInFlightWaitTimeoutMs().GetValue();
+  auto poll_interval_ms = query::options::GetTextQueryInFlightPollIntervalMs().GetValue();
+
+  EXPECT_GT(timeout_ms, 0);
+  EXPECT_GT(poll_interval_ms, 0);
+  EXPECT_LT(poll_interval_ms, timeout_ms);
+}
 
 }  // namespace
 

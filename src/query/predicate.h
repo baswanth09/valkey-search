@@ -366,6 +366,11 @@ class ComposedPredicate : public Predicate {
   bool inorder_;
 };
 
+// Helper function to check if a predicate tree contains any text predicates.
+// This is used to determine if a query is a pure text query (text + optional
+// tag/numeric) that requires blocking for in-flight mutations.
+bool ContainsTextPredicate(const Predicate* predicate);
+
 }  // namespace valkey_search::query
 
 #endif  // VALKEYSEARCH_SRC_QUERY_PREDICATE_H_
