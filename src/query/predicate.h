@@ -19,6 +19,23 @@
 #include "vmsdk/src/managed_pointers.h"
 #include "vmsdk/src/type_conversions.h"
 
+// Forward declaration for utility functions
+namespace valkey_search::query {
+class Predicate;
+
+// Returns true if the predicate contains any text predicates (kText type).
+// This is used to determine if a query requires waiting for in-flight
+// mutations to complete before evaluation.
+bool ContainsTextPredicate(const Predicate* predicate);
+
+// Returns true if the predicate contains any vector predicates.
+// Note: Vector predicates are not represented in the Predicate class directly,
+// they are handled separately through the vector index. This is a placeholder
+// for future use.
+bool ContainsVectorPredicate(const Predicate* predicate);
+
+}  // namespace valkey_search::query
+
 namespace valkey_search::indexes {
 class Text;
 class Numeric;

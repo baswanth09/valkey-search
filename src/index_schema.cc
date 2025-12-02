@@ -1225,6 +1225,43 @@ bool IndexSchema::IsKeyInFlight(const InternedStringPtr &key) const {
   return tracked_mutated_records_.contains(key);
 }
 
+std::vector<InternedStringPtr> IndexSchema::GetConflictingInFlightKeys(
+    const std::vector<InternedStringPtr> &keys) const {
+  std::vector<InternedStringPtr> conflicting_keys;
+  absl::MutexLock lock(&mutated_records_mutex_);
+  for (const auto &key : keys) {
+    if (tracked_mutated_records_.contains(key)) {
+      conflicting_keys.push_back(key);
+    }
+  }
+  return conflicting_keys;
+}
+
+bool IndexSchema::WaitForInFlightKeys(const std::vector<InternedStringPtr> &keys,
+                                      absl::Duration timeout) const {
+  if (keys.empty()) {
+    return true;
+  }
+
+  absl::Time deadline = absl::Now() + timeout;
+  absl::MutexLock lock(&mutated_records_mutex_);
+
+  // Wait until all specified keys are no longer in-flight, or timeout expires
+  auto condition = [this, &keys]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(
+                       mutated_records_mutex_) {
+    for (const auto &key : keys) {
+      if (tracked_mutated_records_.contains(key)) {
+        return false;  // Still have in-flight keys
+      }
+    }
+    return true;  // All keys completed
+  };
+
+  // Use AwaitWithDeadline to wait for the condition or timeout
+  return mutated_records_mutex_.AwaitWithDeadline(absl::Condition(&condition),
+                                                  deadline);
+}
+
 bool IndexSchema::InTrackedMutationRecords(
     const InternedStringPtr &key, const std::string &identifier) const {
   absl::MutexLock lock(&mutated_records_mutex_);

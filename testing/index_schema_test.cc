@@ -2252,4 +2252,68 @@ TEST_F(IndexSchemaRDBTest, ComprehensiveSkipLoadTest) {
   LOG(INFO) << "=== Comprehensive Skip Load Test Completed ===";
 }
 
+// Tests for in-flight key detection and waiting mechanisms
+class InFlightKeyTest : public ValkeySearchTest {};
+
+TEST_F(InFlightKeyTest, GetConflictingInFlightKeysNoConflicts) {
+  ValkeyModuleCtx fake_ctx;
+  vmsdk::ThreadPool mutations_thread_pool("writer-thread-pool-", 1);
+  mutations_thread_pool.StartWorkers();
+
+  std::vector<absl::string_view> key_prefixes = {"prefix:"};
+  std::string index_schema_name_str("index_schema_name");
+  auto index_schema = MockIndexSchema::Create(
+                          &fake_ctx, index_schema_name_str, key_prefixes,
+                          std::make_unique<HashAttributeDataType>(),
+                          &mutations_thread_pool)
+                          .value();
+
+  // Create some keys to check
+  auto key1 = StringInternStore::Intern("key1");
+  auto key2 = StringInternStore::Intern("key2");
+  std::vector<InternedStringPtr> keys_to_check = {key1, key2};
+
+  // No keys are in-flight, so should return empty
+  auto conflicting = index_schema->GetConflictingInFlightKeys(keys_to_check);
+  EXPECT_TRUE(conflicting.empty());
+}
+
+TEST_F(InFlightKeyTest, WaitForInFlightKeysNoKeys) {
+  ValkeyModuleCtx fake_ctx;
+  vmsdk::ThreadPool mutations_thread_pool("writer-thread-pool-", 1);
+  mutations_thread_pool.StartWorkers();
+
+  std::vector<absl::string_view> key_prefixes = {"prefix:"};
+  std::string index_schema_name_str("index_schema_name");
+  auto index_schema = MockIndexSchema::Create(
+                          &fake_ctx, index_schema_name_str, key_prefixes,
+                          std::make_unique<HashAttributeDataType>(),
+                          &mutations_thread_pool)
+                          .value();
+
+  // Empty keys list should return true immediately
+  std::vector<InternedStringPtr> empty_keys;
+  EXPECT_TRUE(index_schema->WaitForInFlightKeys(empty_keys, absl::Seconds(1)));
+}
+
+TEST_F(InFlightKeyTest, WaitForInFlightKeysNotInFlight) {
+  ValkeyModuleCtx fake_ctx;
+  vmsdk::ThreadPool mutations_thread_pool("writer-thread-pool-", 1);
+  mutations_thread_pool.StartWorkers();
+
+  std::vector<absl::string_view> key_prefixes = {"prefix:"};
+  std::string index_schema_name_str("index_schema_name");
+  auto index_schema = MockIndexSchema::Create(
+                          &fake_ctx, index_schema_name_str, key_prefixes,
+                          std::make_unique<HashAttributeDataType>(),
+                          &mutations_thread_pool)
+                          .value();
+
+  // Keys that are not in-flight should return true immediately
+  auto key1 = StringInternStore::Intern("key1");
+  auto key2 = StringInternStore::Intern("key2");
+  std::vector<InternedStringPtr> keys = {key1, key2};
+  EXPECT_TRUE(index_schema->WaitForInFlightKeys(keys, absl::Seconds(1)));
+}
+
 }  // namespace valkey_search

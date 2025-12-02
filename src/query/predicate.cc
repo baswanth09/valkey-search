@@ -25,6 +25,44 @@
 
 namespace valkey_search::query {
 
+bool ContainsTextPredicate(const Predicate* predicate) {
+  if (predicate == nullptr) {
+    return false;
+  }
+
+  switch (predicate->GetType()) {
+    case PredicateType::kText:
+      return true;
+
+    case PredicateType::kNegate: {
+      auto negate_predicate = dynamic_cast<const NegatePredicate*>(predicate);
+      return ContainsTextPredicate(negate_predicate->GetPredicate());
+    }
+
+    case PredicateType::kComposedAnd:
+    case PredicateType::kComposedOr: {
+      auto composed_predicate =
+          dynamic_cast<const ComposedPredicate*>(predicate);
+      return ContainsTextPredicate(composed_predicate->GetLhsPredicate()) ||
+             ContainsTextPredicate(composed_predicate->GetRhsPredicate());
+    }
+
+    case PredicateType::kTag:
+    case PredicateType::kNumeric:
+    case PredicateType::kNone:
+    default:
+      return false;
+  }
+}
+
+bool ContainsVectorPredicate(const Predicate* predicate) {
+  // Vector predicates are not represented in the Predicate class directly.
+  // They are handled separately through the vector index in SearchParameters.
+  // This function is a placeholder for future use if vector predicates are
+  // added to the predicate tree.
+  return false;
+}
+
 EvaluationResult NegatePredicate::Evaluate(Evaluator& evaluator) const {
   EvaluationResult result = predicate_->Evaluate(evaluator);
   return EvaluationResult(!result.matches);

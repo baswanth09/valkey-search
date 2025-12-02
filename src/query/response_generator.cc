@@ -12,12 +12,14 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/time.h"
 #include "src/attribute_data_type.h"
 #include "src/indexes/tag.h"
 #include "src/indexes/text.h"
@@ -25,6 +27,7 @@
 #include "src/metrics.h"
 #include "src/query/predicate.h"
 #include "src/query/search.h"
+#include "vmsdk/src/log.h"
 #include "vmsdk/src/managed_pointers.h"
 #include "vmsdk/src/module_config.h"
 #include "vmsdk/src/status/status_macros.h"
@@ -76,6 +79,39 @@ vmsdk::config::Number &GetMaxSearchResultFieldsCount() {
 }  // namespace valkey_search::options
 
 namespace valkey_search::query {
+
+namespace {
+// Default timeout for waiting on in-flight mutations before proceeding.
+// This is used to prevent live-lock scenarios where new mutations keep
+// arriving indefinitely.
+constexpr absl::Duration kDefaultInFlightWaitTimeout = absl::Seconds(5);
+
+// Maximum number of retry attempts when waiting for in-flight mutations.
+// After this many retries with conflicts still present, we proceed with
+// available results.
+constexpr int kMaxInFlightRetryAttempts = 3;
+
+// Interval between retry attempts when checking for in-flight conflicts.
+constexpr absl::Duration kInFlightRetryInterval = absl::Milliseconds(100);
+
+}  // namespace
+
+bool IsPureTextQuery(const query::SearchParameters &parameters) {
+  // A pure text query is:
+  // 1. A non-vector query (no vector attribute_alias)
+  // 2. Contains text predicates in its filter
+  //
+  // Note: Pure text queries may also contain tag or numeric predicates,
+  // but the presence of text predicates is what triggers the need for
+  // blocking on in-flight mutations.
+  if (!parameters.IsNonVectorQuery()) {
+    return false;
+  }
+
+  // Check if the filter predicate contains any text predicates
+  return ContainsTextPredicate(
+      parameters.filter_parse_results.root_predicate.get());
+}
 
 class PredicateEvaluator : public query::Evaluator {
  public:
@@ -150,10 +186,11 @@ bool VerifyFilter(const query::Predicate *predicate, const RecordsMap &records,
     return true;
   }
   // For text predicates, evaluate using the text index instead of raw data.
+  // At this point, the blocking mechanism in ProcessNeighborsForReply has
+  // already ensured that any in-flight mutations for this key have completed,
+  // so we can safely evaluate against the text index.
   if (parameters.index_schema &&
       parameters.index_schema->GetTextIndexSchema()) {
-    // TODO: Wait for any in-flight indexing operations to complete before
-    // acquiring the lock, ensuring we evaluate against the latest index state.
     return parameters.index_schema->GetTextIndexSchema()->WithPerKeyTextIndexes(
         [&](auto &per_key_indexes) {
           PredicateEvaluator evaluator(records, &per_key_indexes, target_key);
@@ -164,6 +201,94 @@ bool VerifyFilter(const query::Predicate *predicate, const RecordsMap &records,
   PredicateEvaluator evaluator(records);
   EvaluationResult result = predicate->Evaluate(evaluator);
   return result.matches;
+}
+
+// Waits for in-flight mutations to complete for the given neighbors.
+// This is called for pure text queries to ensure text predicate verification
+// uses the naturally populated indexes.
+//
+// Returns the number of keys that were successfully waited for (i.e., their
+// mutations completed within the timeout).
+size_t WaitForInFlightMutations(
+    ValkeyModuleCtx *ctx, const std::deque<indexes::Neighbor> &neighbors,
+    const query::SearchParameters &parameters) {
+  if (!parameters.index_schema) {
+    return 0;
+  }
+
+  // Collect all neighbor keys
+  std::vector<InternedStringPtr> neighbor_keys;
+  neighbor_keys.reserve(neighbors.size());
+  for (const auto &neighbor : neighbors) {
+    neighbor_keys.push_back(neighbor.external_id);
+  }
+
+  // Get the conflicting in-flight keys
+  auto conflicting_keys =
+      parameters.index_schema->GetConflictingInFlightKeys(neighbor_keys);
+
+  if (conflicting_keys.empty()) {
+    // No conflicts, proceed immediately
+    return 0;
+  }
+
+  VMSDK_LOG(DEBUG, ctx)
+      << "Pure text query detected " << conflicting_keys.size()
+      << " in-flight mutations for result keys. Waiting for completion.";
+
+  // Track that we're waiting for in-flight mutations
+  ++Metrics::GetStats().query_in_flight_wait_cnt;
+
+  // Wait for the conflicting keys to complete their mutations
+  // We use a retry loop with timeout to handle the case where new mutations
+  // arrive while we're waiting (live-lock scenario)
+  size_t waited_keys = 0;
+  for (int retry = 0; retry < kMaxInFlightRetryAttempts; ++retry) {
+    // Wait for the current set of conflicting keys
+    bool all_completed = parameters.index_schema->WaitForInFlightKeys(
+        conflicting_keys, kDefaultInFlightWaitTimeout);
+
+    if (all_completed) {
+      waited_keys = conflicting_keys.size();
+      VMSDK_LOG(DEBUG, ctx)
+          << "All " << waited_keys
+          << " in-flight mutations completed. Proceeding with evaluation.";
+      break;
+    }
+
+    // Check for new conflicts after waiting
+    conflicting_keys =
+        parameters.index_schema->GetConflictingInFlightKeys(neighbor_keys);
+
+    if (conflicting_keys.empty()) {
+      // All conflicts resolved
+      VMSDK_LOG(DEBUG, ctx)
+          << "All in-flight mutations resolved after retry " << (retry + 1);
+      break;
+    }
+
+    VMSDK_LOG(DEBUG, ctx)
+        << "Retry " << (retry + 1) << "/" << kMaxInFlightRetryAttempts
+        << ": Still " << conflicting_keys.size()
+        << " in-flight keys. Waiting...";
+
+    // Brief sleep before retry to avoid busy-waiting
+    if (retry < kMaxInFlightRetryAttempts - 1) {
+      absl::SleepFor(kInFlightRetryInterval);
+    }
+  }
+
+  // If we still have conflicts after max retries, log a warning and proceed
+  // This handles the live-lock scenario where mutations keep arriving
+  if (!conflicting_keys.empty()) {
+    VMSDK_LOG(WARNING, ctx)
+        << "Timeout waiting for " << conflicting_keys.size()
+        << " in-flight mutations. Proceeding with available index state. "
+        << "This may result in stale or incomplete results for some keys.";
+    ++Metrics::GetStats().query_in_flight_timeout_cnt;
+  }
+
+  return waited_keys;
 }
 
 absl::StatusOr<RecordsMap> GetContentNoReturnJson(
@@ -267,11 +392,24 @@ void ProcessNonVectorNeighborsForReply(
 //
 // Any neighbors already contained in the attribute content map will be skipped.
 // Any data not found locally will be skipped.
+//
+// For pure text queries (non-vector queries with text predicates), this
+// function will block and wait for any in-flight mutations on the result keys
+// to complete before evaluating the text predicates. This ensures that text
+// predicate verification uses the naturally populated indexes rather than
+// creating expensive temporary text indexes.
 void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
                               const AttributeDataType &attribute_data_type,
                               std::deque<indexes::Neighbor> &neighbors,
                               const query::SearchParameters &parameters,
                               const std::string &identifier) {
+  // For pure text queries, wait for any in-flight mutations to complete
+  // before evaluating text predicates. This ensures we use the naturally
+  // populated indexes rather than creating temporary text indexes.
+  if (IsPureTextQuery(parameters)) {
+    WaitForInFlightMutations(ctx, neighbors, parameters);
+  }
+
   const auto max_content_size =
       options::GetMaxSearchResultRecordSize().GetValue();
   const auto max_content_fields =

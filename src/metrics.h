@@ -129,6 +129,10 @@ class Metrics {
     std::atomic<uint64_t> info_fanout_retry_cnt{0};
     std::atomic<uint64_t> info_fanout_fail_cnt{0};
     std::atomic<uint64_t> pause_handle_cluster_message_round_cnt{0};
+
+    // In-flight mutation blocking metrics for pure text queries
+    std::atomic<uint64_t> query_in_flight_timeout_cnt{0};
+    std::atomic<uint64_t> query_in_flight_wait_cnt{0};
   };
   static Stats& GetStats() { return GetInstance().stats_; }
 

@@ -543,6 +543,87 @@ INSTANTIATE_TEST_SUITE_P(
       return info.param.test_name;
     });
 
+// Tests for IsPureTextQuery and ContainsTextPredicate functions
+class PureTextQueryTest : public ValkeySearchTest {};
+
+TEST_F(PureTextQueryTest, NonVectorQueryWithTextPredicate) {
+  query::SearchParameters parameters(100000, nullptr);
+  parameters.attribute_alias = "";  // Non-vector query
+
+  // Create a text predicate
+  auto text_predicate =
+      std::make_unique<MockPredicate>(query::PredicateType::kText);
+  parameters.filter_parse_results.root_predicate = std::move(text_predicate);
+
+  EXPECT_TRUE(query::IsPureTextQuery(parameters));
+}
+
+TEST_F(PureTextQueryTest, NonVectorQueryWithNumericPredicate) {
+  query::SearchParameters parameters(100000, nullptr);
+  parameters.attribute_alias = "";  // Non-vector query
+
+  // Create a numeric predicate (not a text predicate)
+  auto numeric_predicate =
+      std::make_unique<MockPredicate>(query::PredicateType::kNumeric);
+  parameters.filter_parse_results.root_predicate = std::move(numeric_predicate);
+
+  EXPECT_FALSE(query::IsPureTextQuery(parameters));
+}
+
+TEST_F(PureTextQueryTest, NonVectorQueryWithTagPredicate) {
+  query::SearchParameters parameters(100000, nullptr);
+  parameters.attribute_alias = "";  // Non-vector query
+
+  // Create a tag predicate (not a text predicate)
+  auto tag_predicate =
+      std::make_unique<MockPredicate>(query::PredicateType::kTag);
+  parameters.filter_parse_results.root_predicate = std::move(tag_predicate);
+
+  EXPECT_FALSE(query::IsPureTextQuery(parameters));
+}
+
+TEST_F(PureTextQueryTest, VectorQueryWithTextPredicate) {
+  query::SearchParameters parameters(100000, nullptr);
+  parameters.attribute_alias = "vector_field";  // Vector query
+
+  // Create a text predicate
+  auto text_predicate =
+      std::make_unique<MockPredicate>(query::PredicateType::kText);
+  parameters.filter_parse_results.root_predicate = std::move(text_predicate);
+
+  // Should not be a pure text query because it's a vector query
+  EXPECT_FALSE(query::IsPureTextQuery(parameters));
+}
+
+TEST_F(PureTextQueryTest, NonVectorQueryWithNoPredicate) {
+  query::SearchParameters parameters(100000, nullptr);
+  parameters.attribute_alias = "";  // Non-vector query
+  parameters.filter_parse_results.root_predicate = nullptr;
+
+  // Should not be a pure text query because there's no predicate
+  EXPECT_FALSE(query::IsPureTextQuery(parameters));
+}
+
+// Test ContainsTextPredicate with composed predicates
+TEST_F(PureTextQueryTest, ContainsTextPredicateNullPredicate) {
+  EXPECT_FALSE(query::ContainsTextPredicate(nullptr));
+}
+
+TEST_F(PureTextQueryTest, ContainsTextPredicateTextType) {
+  MockPredicate predicate(query::PredicateType::kText);
+  EXPECT_TRUE(query::ContainsTextPredicate(&predicate));
+}
+
+TEST_F(PureTextQueryTest, ContainsTextPredicateNumericType) {
+  MockPredicate predicate(query::PredicateType::kNumeric);
+  EXPECT_FALSE(query::ContainsTextPredicate(&predicate));
+}
+
+TEST_F(PureTextQueryTest, ContainsTextPredicateTagType) {
+  MockPredicate predicate(query::PredicateType::kTag);
+  EXPECT_FALSE(query::ContainsTextPredicate(&predicate));
+}
+
 }  // namespace
 
 }  // namespace valkey_search

@@ -294,6 +294,18 @@ class IndexSchema : public KeyspaceEventSubscription,
       ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
   bool IsKeyInFlight(const InternedStringPtr &key) const
       ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
+  // Returns the set of in-flight keys that overlap with the given set of keys.
+  // This is used to detect conflicts between query results and pending
+  // mutations.
+  std::vector<InternedStringPtr> GetConflictingInFlightKeys(
+      const std::vector<InternedStringPtr> &keys) const
+      ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
+  // Blocks until all the specified keys have completed their in-flight
+  // mutations, or until the timeout expires. Returns true if all keys completed
+  // their mutations, false if timeout expired.
+  bool WaitForInFlightKeys(const std::vector<InternedStringPtr> &keys,
+                           absl::Duration timeout) const
+      ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);
   std::optional<MutatedAttributes> ConsumeTrackedMutatedAttribute(
       const InternedStringPtr &key, bool first_time)
       ABSL_LOCKS_EXCLUDED(mutated_records_mutex_);

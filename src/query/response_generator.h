@@ -31,11 +31,22 @@ vmsdk::config::Number &GetMaxSearchResultFieldsCount();
 }  // namespace valkey_search::options
 namespace valkey_search::query {
 
+// Checks if the query is a pure text query, i.e., it's a non-vector query
+// and contains text predicates. Such queries require waiting for in-flight
+// mutations to complete before text index evaluation.
+bool IsPureTextQuery(const query::SearchParameters &parameters);
+
 // Adds all local content for neighbors to the list of neighbors.
 // Skipping neighbors if one of the following:
 // Neighbor already contained in the attribute content map.
 // Neighbor without any attribute content.
 // Neighbor not comply to the pre-filter expression.
+//
+// For pure text queries (non-vector queries with text predicates), this
+// function will block and wait for any in-flight mutations on the result keys
+// to complete before evaluating the text predicates. This ensures that text
+// predicate verification uses the naturally populated indexes rather than
+// creating expensive temporary text indexes.
 void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
                               const AttributeDataType &attribute_data_type,
                               std::deque<indexes::Neighbor> &neighbors,
