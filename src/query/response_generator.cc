@@ -78,7 +78,7 @@ vmsdk::config::Number &GetMaxSearchResultFieldsCount() {
 namespace valkey_search::query {
 
 // Recursively check if a predicate tree contains any text predicates.
-bool ContainsTextPredicate(const Predicate *predicate) {
+bool HasTextPredicate(const Predicate *predicate) {
   if (predicate == nullptr) {
     return false;
   }
@@ -89,12 +89,12 @@ bool ContainsTextPredicate(const Predicate *predicate) {
     case PredicateType::kComposedAnd:
     case PredicateType::kComposedOr: {
       auto *composed = dynamic_cast<const ComposedPredicate *>(predicate);
-      return ContainsTextPredicate(composed->GetLhsPredicate()) ||
-             ContainsTextPredicate(composed->GetRhsPredicate());
+      return HasTextPredicate(composed->GetLhsPredicate()) ||
+             HasTextPredicate(composed->GetRhsPredicate());
     }
     case PredicateType::kNegate: {
       auto *negate = dynamic_cast<const NegatePredicate *>(predicate);
-      return ContainsTextPredicate(negate->GetPredicate());
+      return HasTextPredicate(negate->GetPredicate());
     }
     default:
       return false;
@@ -116,7 +116,7 @@ bool ShouldBlockOnInFlightMutations(const SearchParameters &parameters) {
   }
 
   // Check if the predicate tree contains any text predicates
-  return ContainsTextPredicate(
+  return HasTextPredicate(
       parameters.filter_parse_results.root_predicate.get());
 }
 

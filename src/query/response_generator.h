@@ -65,7 +65,7 @@ ProcessingStatus ProcessNonVectorNeighborsForReply(
 // Helper function to check if a predicate tree contains any text predicates.
 // Used to determine if a query is a "pure full-text query" that requires
 // blocking on in-flight mutations.
-bool ContainsTextPredicate(const Predicate *predicate);
+bool HasTextPredicate(const Predicate *predicate);
 
 // Helper function to determine if a query should block on in-flight mutations.
 // Returns true for pure full-text queries (non-vector queries with text
