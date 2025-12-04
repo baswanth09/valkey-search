@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -45,6 +46,12 @@
 #include "vmsdk/src/type_conversions.h"
 #include "vmsdk/src/utils.h"
 #include "vmsdk/src/valkey_module_api/valkey_module.h"
+
+namespace {
+// Delay in milliseconds between retry attempts when waiting for in-flight
+// mutations to complete for pure full-text queries on remote shards.
+constexpr mstime_t kRemoteTextQueryRetryDelayMs = 1;
+}  // namespace
 
 namespace valkey_search::coordinator {
 
@@ -112,6 +119,90 @@ void SerializeNeighbors(SearchIndexPartitionResponse* response,
   }
 }
 
+// State for remote shard text query retry when in-flight mutations are
+// detected.
+struct RemoteTextQueryRetryState {
+  std::unique_ptr<query::SearchParameters> parameters;
+  std::deque<indexes::Neighbor> neighbors;
+  SearchIndexPartitionResponse* response;
+  grpc::ServerUnaryReactor* reactor;
+  std::unique_ptr<vmsdk::StopWatch> latency_sample;
+
+  RemoteTextQueryRetryState(std::unique_ptr<query::SearchParameters> p,
+                            std::deque<indexes::Neighbor> n,
+                            SearchIndexPartitionResponse* resp,
+                            grpc::ServerUnaryReactor* react,
+                            std::unique_ptr<vmsdk::StopWatch> sample)
+      : parameters(std::move(p)),
+        neighbors(std::move(n)),
+        response(resp),
+        reactor(react),
+        latency_sample(std::move(sample)) {}
+};
+
+// Forward declaration
+void ProcessRemoteTextQueryWithRetry(RemoteTextQueryRetryState* state);
+
+// Timer callback for remote text query retry
+void RemoteTextQueryRetryTimerCallback(ValkeyModuleCtx* /*ctx*/, void* data) {
+  auto* state = static_cast<RemoteTextQueryRetryState*>(data);
+  ProcessRemoteTextQueryWithRetry(state);
+}
+
+// Process a remote shard's pure full-text query with retry logic for in-flight
+// mutations. If conflicts are detected and timeout hasn't occurred, schedules
+// a retry. Otherwise, completes processing and responds via gRPC.
+void ProcessRemoteTextQueryWithRetry(RemoteTextQueryRetryState* state) {
+  auto& neighbors = state->neighbors;
+  auto* parameters = state->parameters.get();
+
+  // Check if we've timed out
+  bool timed_out = parameters->cancellation_token->IsCancelled();
+  if (timed_out &&
+      !valkey_search::options::GetEnablePartialResults().GetValue()) {
+    // Timed out and partial results disabled - return error
+    state->reactor->Finish({grpc::StatusCode::DEADLINE_EXCEEDED,
+                            "Search operation cancelled due to timeout"});
+    RecordSearchMetrics(true, std::move(state->latency_sample));
+    delete state;
+    return;
+  }
+
+  // Create a thread-safe context for processing
+  auto ctx = vmsdk::MakeUniqueValkeyThreadSafeContext(nullptr);
+  const auto& attribute_data_type =
+      parameters->index_schema->GetAttributeDataType();
+
+  // Try to process neighbors - check for conflicts
+  query::ProcessingStatus status;
+  if (parameters->attribute_alias.empty()) {
+    status = query::ProcessNonVectorNeighborsForReply(
+        ctx.get(), attribute_data_type, neighbors, *parameters);
+  } else {
+    auto vector_identifier =
+        parameters->index_schema->GetIdentifier(parameters->attribute_alias)
+            .value();
+    status = query::ProcessNeighborsForReply(
+        ctx.get(), attribute_data_type, neighbors, *parameters,
+        vector_identifier);
+  }
+
+  if (status == query::ProcessingStatus::kConflictsDetected && !timed_out) {
+    // Conflicts detected and not timed out - schedule retry
+    vmsdk::StartTimerFromBackgroundThread(ctx.get(),
+                                          kRemoteTextQueryRetryDelayMs,
+                                          RemoteTextQueryRetryTimerCallback,
+                                          state);
+    return;
+  }
+
+  // Processing complete - serialize and respond
+  SerializeNeighbors(state->response, neighbors);
+  state->reactor->Finish(grpc::Status::OK);
+  RecordSearchMetrics(false, std::move(state->latency_sample));
+  delete state;
+}
+
 grpc::ServerUnaryReactor* Service::SearchIndexPartition(
     grpc::CallbackServerContext* context,
     const SearchIndexPartitionRequest* request,
@@ -127,10 +218,15 @@ grpc::ServerUnaryReactor* Service::SearchIndexPartition(
     return reactor;
   }
 
+  // Check if this is a pure full-text query that needs special retry handling
+  bool needs_text_query_retry =
+      query::ShouldBlockOnInFlightMutations(*vector_search_parameters.value());
+
   // Enqueue into the thread pool
   auto status = query::SearchAsync(
       std::move(*vector_search_parameters), reader_thread_pool_,
-      [response, reactor, latency_sample = std::move(latency_sample)](
+      [response, reactor, latency_sample = std::move(latency_sample),
+       needs_text_query_retry](
           auto& neighbors,
           std::unique_ptr<query::SearchParameters> parameters) mutable {
         if (!neighbors.ok()) {
@@ -150,6 +246,18 @@ grpc::ServerUnaryReactor* Service::SearchIndexPartition(
           reactor->Finish(grpc::Status::OK);
           RecordSearchMetrics(false, std::move(latency_sample));
         } else {
+          // For pure full-text queries, use retry mechanism to wait for
+          // in-flight mutations
+          if (needs_text_query_retry) {
+            auto* state = new RemoteTextQueryRetryState(
+                std::move(parameters), std::move(neighbors.value()), response,
+                reactor, std::move(latency_sample));
+            vmsdk::RunByMain(
+                [state]() { ProcessRemoteTextQueryWithRetry(state); }, true);
+            return;
+          }
+
+          // Standard path for vector queries
           vmsdk::RunByMain([parameters = std::move(parameters), response,
                             reactor, latency_sample = std::move(latency_sample),
                             neighbors =

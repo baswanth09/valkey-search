@@ -77,6 +77,49 @@ vmsdk::config::Number &GetMaxSearchResultFieldsCount() {
 
 namespace valkey_search::query {
 
+// Recursively check if a predicate tree contains any text predicates.
+bool ContainsTextPredicate(const Predicate *predicate) {
+  if (predicate == nullptr) {
+    return false;
+  }
+
+  switch (predicate->GetType()) {
+    case PredicateType::kText:
+      return true;
+    case PredicateType::kComposedAnd:
+    case PredicateType::kComposedOr: {
+      auto *composed = dynamic_cast<const ComposedPredicate *>(predicate);
+      return ContainsTextPredicate(composed->GetLhsPredicate()) ||
+             ContainsTextPredicate(composed->GetRhsPredicate());
+    }
+    case PredicateType::kNegate: {
+      auto *negate = dynamic_cast<const NegatePredicate *>(predicate);
+      return ContainsTextPredicate(negate->GetPredicate());
+    }
+    default:
+      return false;
+  }
+}
+
+// Determine if a query should block on in-flight mutations.
+// This applies only to pure full-text queries: non-vector queries that
+// contain text predicates (may also contain tag/numeric predicates).
+bool ShouldBlockOnInFlightMutations(const SearchParameters &parameters) {
+  // Only applies to non-vector queries
+  if (!parameters.IsNonVectorQuery()) {
+    return false;
+  }
+
+  // Must have a filter with text predicates
+  if (!parameters.filter_parse_results.root_predicate) {
+    return false;
+  }
+
+  // Check if the predicate tree contains any text predicates
+  return ContainsTextPredicate(
+      parameters.filter_parse_results.root_predicate.get());
+}
+
 class PredicateEvaluator : public query::Evaluator {
  public:
   explicit PredicateEvaluator(const RecordsMap &records)
@@ -256,22 +299,43 @@ absl::StatusOr<RecordsMap> GetContent(
 
 // Adds all local content for neighbors to the list of neighbors.
 // This function is meant to be used for non-vector queries.
-void ProcessNonVectorNeighborsForReply(
+ProcessingStatus ProcessNonVectorNeighborsForReply(
     ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
     std::deque<indexes::Neighbor> &neighbors,
     const query::SearchParameters &parameters) {
-  ProcessNeighborsForReply(ctx, attribute_data_type, neighbors, parameters, "");
+  return ProcessNeighborsForReply(ctx, attribute_data_type, neighbors,
+                                  parameters, "");
 }
 
 // Adds all local content for neighbors to the list of neighbors.
 //
 // Any neighbors already contained in the attribute content map will be skipped.
 // Any data not found locally will be skipped.
-void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
-                              const AttributeDataType &attribute_data_type,
-                              std::deque<indexes::Neighbor> &neighbors,
-                              const query::SearchParameters &parameters,
-                              const std::string &identifier) {
+//
+// For pure full-text queries, this function first checks if any result keys
+// have in-flight mutations. If so, it returns kConflictsDetected to signal
+// that the caller should retry after the mutations complete.
+ProcessingStatus ProcessNeighborsForReply(
+    ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
+    std::deque<indexes::Neighbor> &neighbors,
+    const query::SearchParameters &parameters, const std::string &identifier) {
+  // For pure full-text queries, check for in-flight mutations before
+  // processing. This ensures we evaluate text predicates against the
+  // up-to-date per-key text indexes populated by background ingestion.
+  if (ShouldBlockOnInFlightMutations(parameters)) {
+    for (const auto &neighbor : neighbors) {
+      // Skip neighbors that already have content (e.g., from remote nodes)
+      if (neighbor.attribute_contents.has_value()) {
+        continue;
+      }
+      // Check if this key has pending mutations
+      if (parameters.index_schema->IsKeyInFlight(neighbor.external_id)) {
+        // Conflict detected - caller should retry after mutations complete
+        return ProcessingStatus::kConflictsDetected;
+      }
+    }
+  }
+
   const auto max_content_size =
       options::GetMaxSearchResultRecordSize().GetValue();
   const auto max_content_fields =
@@ -320,13 +384,14 @@ void ProcessNeighborsForReply(ValkeyModuleCtx *ctx,
     }
   }
   // Remove all entries that don't have content now.
-  // TODO: incorporate a retry in case of removal.
   neighbors.erase(
       std::remove_if(neighbors.begin(), neighbors.end(),
                      [](const indexes::Neighbor &neighbor) {
                        return !neighbor.attribute_contents.has_value();
                      }),
       neighbors.end());
+
+  return ProcessingStatus::kComplete;
 }
 
 }  // namespace valkey_search::query

@@ -7,18 +7,27 @@
 
 #include "src/commands/commands.h"
 
+#include <memory>
+
 #include "fanout.h"
 #include "ft_create_parser.h"
 #include "src/acl.h"
 #include "src/commands/ft_search.h"
+#include "src/query/response_generator.h"
 #include "src/query/search.h"
 #include "src/schema_manager.h"
 #include "src/valkey_search.h"
 #include "valkey_search_options.h"
 #include "vmsdk/src/cluster_map.h"
 #include "vmsdk/src/debug.h"
+#include "vmsdk/src/utils.h"
 
 namespace valkey_search {
+
+// Delay in milliseconds between retry attempts when waiting for in-flight
+// mutations to complete for pure full-text queries.
+constexpr mstime_t kTextQueryRetryDelayMs = 1;
+
 namespace async {
 
 struct Result {
@@ -61,6 +70,76 @@ void Free([[maybe_unused]] ValkeyModuleCtx *ctx, void *privdata) {
 }
 
 }  // namespace async
+
+// State for text query retry when in-flight mutations are detected.
+// Holds all state needed to retry processing and eventually unblock the client.
+struct TextQueryRetryState {
+  vmsdk::BlockedClient blocked_client;
+  std::deque<indexes::Neighbor> neighbors;
+  std::unique_ptr<QueryCommand> parameters;
+
+  TextQueryRetryState(vmsdk::BlockedClient bc,
+                      std::deque<indexes::Neighbor> n,
+                      std::unique_ptr<QueryCommand> p)
+      : blocked_client(std::move(bc)),
+        neighbors(std::move(n)),
+        parameters(std::move(p)) {}
+};
+
+// Forward declaration
+void ProcessTextQueryWithRetry(TextQueryRetryState *state);
+
+// Timer callback for text query retry
+void TextQueryRetryTimerCallback(ValkeyModuleCtx * /*ctx*/, void *data) {
+  auto *state = static_cast<TextQueryRetryState *>(data);
+  ProcessTextQueryWithRetry(state);
+}
+
+// Process a pure full-text query with retry logic for in-flight mutations.
+// If conflicts are detected and timeout hasn't occurred, schedules a retry.
+// Otherwise, completes processing and unblocks the client.
+void ProcessTextQueryWithRetry(TextQueryRetryState *state) {
+  auto &neighbors = state->neighbors;
+  auto *parameters = state->parameters.get();
+
+  // Check if we've timed out
+  bool timed_out = parameters->cancellation_token->IsCancelled();
+  if (timed_out && !options::GetEnablePartialResults().GetValue()) {
+    // Timed out and partial results disabled - return error
+    auto result = std::make_unique<async::Result>(async::Result{
+        .neighbors = absl::DeadlineExceededError(
+            "Search operation cancelled due to timeout"),
+        .parameters = std::move(state->parameters),
+    });
+    state->blocked_client.SetReplyPrivateData(result.release());
+    delete state;
+    return;
+  }
+
+  // Create a thread-safe context for processing
+  auto ctx = vmsdk::MakeUniqueValkeyThreadSafeContext(nullptr);
+
+  // Try to process neighbors - check for conflicts
+  auto status = query::ProcessNonVectorNeighborsForReply(
+      ctx.get(), parameters->index_schema->GetAttributeDataType(), neighbors,
+      *parameters);
+
+  if (status == query::ProcessingStatus::kConflictsDetected && !timed_out) {
+    // Conflicts detected and not timed out - schedule retry
+    // Use StartTimerFromBackgroundThread since we might not be on main thread
+    vmsdk::StartTimerFromBackgroundThread(ctx.get(), kTextQueryRetryDelayMs,
+                                          TextQueryRetryTimerCallback, state);
+    return;
+  }
+
+  // Processing complete - prepare result and unblock client
+  auto result = std::make_unique<async::Result>(async::Result{
+      .neighbors = std::move(neighbors),
+      .parameters = std::move(state->parameters),
+  });
+  state->blocked_client.SetReplyPrivateData(result.release());
+  delete state;
+}
 
 CONTROLLED_BOOLEAN(ForceReplicasOnly, false);
 
@@ -113,11 +192,31 @@ absl::Status QueryCommand::Execute(ValkeyModuleCtx *ctx,
     vmsdk::BlockedClient blocked_client(ctx, async::Reply, async::Timeout,
                                         async::Free, parameters->timeout_ms);
     blocked_client.MeasureTimeStart();
-    auto on_done_callback = [blocked_client = std::move(blocked_client)](
+
+    // Check if this is a pure full-text query that needs special retry handling
+    bool needs_text_query_retry =
+        query::ShouldBlockOnInFlightMutations(*parameters);
+
+    auto on_done_callback = [blocked_client = std::move(blocked_client),
+                             needs_text_query_retry](
                                 auto &neighbors, auto parameters) mutable {
       std::unique_ptr<QueryCommand> upcast_parameters(
           dynamic_cast<QueryCommand *>(parameters.release()));
       CHECK(upcast_parameters != nullptr);
+
+      // For pure full-text queries, use retry mechanism to wait for in-flight
+      // mutations
+      if (needs_text_query_retry && neighbors.ok()) {
+        auto *state = new TextQueryRetryState(std::move(blocked_client),
+                                              std::move(neighbors.value()),
+                                              std::move(upcast_parameters));
+        // Run on main thread to check conflicts and potentially retry
+        vmsdk::RunByMain(
+            [state]() { ProcessTextQueryWithRetry(state); }, true);
+        return;
+      }
+
+      // Standard path for vector queries and error cases
       auto result = std::make_unique<async::Result>(async::Result{
           .neighbors = std::move(neighbors),
           .parameters = std::move(upcast_parameters),
