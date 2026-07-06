@@ -850,6 +850,20 @@ TEST_F(ClusterMapTest, GetRandomReplicaPerShardTest) {
   EXPECT_EQ(shard_ids.size(), 3);
 }
 
+TEST_F(ClusterMapTest, GetTargetsForSlotReplicaOnlyTest) {
+  auto ranges = CreateStandard3ShardConfig();
+  auto cluster_map = CreateClusterMapWithConfig(ranges, primary_ids.at(0));
+
+  ASSERT_NE(cluster_map, nullptr);
+
+  // Slot 8191 is owned by the second shard; RFR must route to its replica.
+  auto targets = cluster_map->GetTargetsForSlot(
+      FanoutTargetMode::kOneReplicaPerShard, false, 8191);
+  ASSERT_EQ(targets.size(), 1u);
+  EXPECT_EQ(targets[0].node_id, replica_ids.at(1));
+  EXPECT_FALSE(targets[0].is_primary);
+}
+
 // ============================================================================
 // Fingerprint and Metadata Tests
 // ============================================================================
